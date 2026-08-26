@@ -1,0 +1,7 @@
+{
+  "name": "AgendaCraft AI",
+  "description": "Agente inteligente para procesar documentos y generar agendas de reuniones estructuradas con línea de tiempo interactiva, participantes y asignación de tiempos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

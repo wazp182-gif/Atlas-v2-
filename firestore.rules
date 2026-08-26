@@ -1,0 +1,206 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 🔒 Helpers de rol — MODELO RBAC OFICIAL OPERACIONES LCT 🔒
+    function isAuth() {
+      return request.auth != null;
+    }
+    function hasUserDoc() {
+      return isAuth() && exists(/databases/$(database)/documents/usuarios/$(request.auth.uid));
+    }
+    function userDoc() {
+      return get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data;
+    }
+    function userRole() {
+      return hasUserDoc() ? userDoc().get('rol', 'operador') : 'operador';
+    }
+
+    function isSuperAdmin() {
+      return isAuth() && (!hasUserDoc() || userRole() == 'super_admin');
+    }
+    function isAdmin() {
+      return isAuth() && (!hasUserDoc() || userRole() == 'admin' || userRole() == 'super_admin');
+    }
+    function isAdminZona() {
+      return isAuth() && (
+        isAdmin() ||
+        userRole() == 'admin_zona' ||
+        userRole() == 'admin_zona_cocina' ||
+        userRole() == 'admin_zona_produccion' ||
+        userRole() == 'admin_sec' ||
+        userRole() == 'jefe_zona'
+      );
+    }
+    function isOperador() {
+      return isAuth();
+    }
+    function isOperadorCocina() {
+      return isAuth();
+    }
+
+    // ── Usuarios ───────────────────────────────────────────────────────────────
+    match /usuarios/{uid} {
+      allow read: if isAuth();
+      allow create, update: if isAuth();
+      allow delete: if isAdmin();
+    }
+
+    // ── Sucursales ─────────────────────────────────────────────────────────────
+    match /sucursales/{branchId} {
+      allow read: if isAuth();
+      allow write: if isAuth();
+    }
+
+    // ── Conteos de Caja ────────────────────────────────────────────────────────
+    match /conteos/{conteoId} {
+      allow read: if isAuth();
+      allow create, update: if isAuth();
+      allow delete: if isAdmin();
+    }
+
+    // ── Bitácora de Auditoría ──────────────────────────────────────────────────
+    match /bitacora/{logId} {
+      allow read: if isAuth();
+      allow create: if isAuth();
+      allow update, delete: if false; // Inmutable
+    }
+
+    // ── Configuración Global ───────────────────────────────────────────────────
+    match /configuracion/{docId} {
+      allow read: if true;
+      allow write: if isAuth();
+    }
+
+    // ── Checklists de Cocina ──────────────────────────────────────────────────
+    match /cocina_checklists/{docId} {
+      allow read: if isAuth();
+      allow create, update: if isAuth();
+      allow delete: if isAdmin();
+    }
+
+    match /actividades_cocina/{docId} {
+      allow read, write: if isAuth();
+    }
+
+    // ── Tarjetas y Configuración de Cocina ─────────────────────────────────────
+    match /cocina_tarjetas_config/{branchId} {
+      allow read, write: if isAuth();
+    }
+
+    // ── Inventarios y Control de Cocina ───────────────────────────────────────
+    match /cocina_inventarios/{docId} {
+      allow read, write: if isAuth();
+    }
+
+    // ── Checklists de Producción ──────────────────────────────────────────────
+    match /produccion_checklists/{docId} {
+      allow read, write: if isAuth();
+    }
+
+    // ── Incidencias de Capitanes ───────────────────────────────────────────────
+    match /incidencias_capitanes/{docId} {
+      allow read, create, update: if isAuth();
+      allow delete: if isAdmin();
+    }
+
+    // ── Ventas por Hora ────────────────────────────────────────────────────────
+    match /registros_ventas/{docId} {
+      allow read, create, update: if isAuth();
+      allow delete: if isAdmin();
+    }
+
+    // ── Registro de Etiquetas 🔴🟡🔵 ──────────────────────────────────────────
+    match /etiquetas_registros/{docId} {
+      allow read, create, update: if isAuth();
+      allow delete: if isAdmin();
+    }
+
+    // ── Stocks e Inventarios Diarios ──────────────────────────────────────────
+    match /stocks_productos/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /inventario_diario/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /refrescos_catalogo/{sucursalId} {
+      allow read, write: if isAuth();
+    }
+    match /productos_catalogo/{tipo} {
+      allow read, write: if isAuth();
+    }
+    match /refrescos_semanas/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /notificaciones/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /auditorias/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /reportes_nocturnos/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /uniforme_reportes/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /auditoria_uso/{docId} {
+      allow read, create: if isAuth();
+      allow update, delete: if false;
+    }
+    match /checklist_templates/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /apoyos_visuales_cocina/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /autorizaciones_apoyos/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /auditoria_apoyos/{docId} {
+      allow read, create: if isAuth();
+      allow update, delete: if false;
+    }
+    match /studio_builder_modules/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /studio_builder_versions/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /studio_builder_responses/{docId} {
+      allow read, create, update: if isAuth();
+      allow delete: if false;
+    }
+    match /studio_builder_audit/{docId} {
+      allow read, create: if isAuth();
+    }
+    match /sheets_queue/{docId} {
+      allow read, create: if isAuth();
+    }
+    match /asistencias_turnos/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /cortes_diarios/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /abastecimiento_reportes/{docId} {
+      allow read, write: if isAuth();
+    }
+    match /abastecimiento_catalogos/{docId} {
+      allow read, write: if isAuth();
+    }
+
+    // ── Atlas Long-Term Memory (Contexto, Preferencias e Historial del Agente) ──
+    match /atlas_memory/{userId} {
+      allow read, write: if isAuth();
+      
+      match /actions/{actionId} {
+        allow read, write: if isAuth();
+      }
+
+      match /{subCollection=**} {
+        allow read, write: if isAuth();
+      }
+    }
+  }
+}
