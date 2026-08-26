@@ -186,6 +186,14 @@ export const AtlasVisualizer: React.FC<AtlasVisualizerProps> = ({
     setCurrentState(state);
   }, [state]);
 
+  useEffect(() => {
+    if (initialTheme) setCurrentTheme(initialTheme);
+  }, [initialTheme]);
+
+  useEffect(() => {
+    if (initialMode) setCurrentMode(initialMode);
+  }, [initialMode]);
+
   const palette = THEME_PALETTES[currentTheme];
 
   // Simulation refs
@@ -221,9 +229,10 @@ export const AtlasVisualizer: React.FC<AtlasVisualizerProps> = ({
 
   // Initialize particles based on selected mode
   const initParticles = useCallback((width: number, height: number, mode: VisualizerMode) => {
+    const pal = THEME_PALETTES[currentTheme];
     const particles: Particle[] = [];
     const count = mode === 'matrix' ? 380 : mode === 'vortex' ? 360 : mode === 'flow' ? 340 : 320;
-    setParticleCount(count);
+    setParticleCount((prev) => (prev === count ? prev : count));
 
     const cx = 0;
     const cy = 0;
@@ -447,7 +456,7 @@ export const AtlasVisualizer: React.FC<AtlasVisualizerProps> = ({
     }
 
     particlesRef.current = particles;
-  }, [palette]);
+  }, [currentTheme]);
 
   // Trigger Shockwave on click / tap
   const triggerShockwave = useCallback((x: number, y: number) => {
@@ -1036,10 +1045,10 @@ export const AtlasVisualizer: React.FC<AtlasVisualizerProps> = ({
             {/* Quick State Trigger Controls */}
             <div className="flex items-center gap-1 bg-slate-900/80 border border-slate-800 rounded-lg p-1 backdrop-blur-md">
               <button
-                onClick={() => handleSetState(currentState === 'thinking' ? 'idle' : 'thinking')}
-                title="Simular Procesamiento / Pensamiento"
-                className={`p-1.5 rounded-md text-xs transition-colors ${
-                  currentState === 'thinking' || currentState === 'processing'
+                onClick={() => handleSetState(currentState === 'processing' ? 'idle' : 'processing')}
+                title="Modo Procesamiento Cuántico"
+                className={`p-1.5 rounded-md text-xs transition-colors cursor-pointer ${
+                  currentState === 'processing' || currentState === 'thinking'
                     ? 'bg-purple-500/30 text-purple-300 border border-purple-500/40'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
                 }`}
@@ -1048,9 +1057,21 @@ export const AtlasVisualizer: React.FC<AtlasVisualizerProps> = ({
               </button>
 
               <button
+                onClick={() => handleSetState(currentState === 'response' ? 'idle' : 'response')}
+                title="Modo Emisión / Proyección de Respuesta"
+                className={`p-1.5 rounded-md text-xs transition-colors cursor-pointer ${
+                  currentState === 'response' || currentState === 'speaking' || currentState === 'projecting'
+                    ? 'bg-emerald-500/30 text-emerald-300 border border-emerald-500/40'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                }`}
+              >
+                <Zap className="w-3.5 h-3.5" />
+              </button>
+
+              <button
                 onClick={() => handleSetState(currentState === 'listening' ? 'idle' : 'listening')}
                 title="Modo Escucha / Audio"
-                className={`p-1.5 rounded-md text-xs transition-colors ${
+                className={`p-1.5 rounded-md text-xs transition-colors cursor-pointer ${
                   currentState === 'listening'
                     ? 'bg-cyan-500/30 text-cyan-300 border border-cyan-500/40'
                     : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
@@ -1132,13 +1153,13 @@ export const AtlasVisualizer: React.FC<AtlasVisualizerProps> = ({
             <div className="mt-3 pt-3 border-t border-slate-800">
               <label className="text-[11px] font-medium text-slate-400 block mb-1.5">Estado de Consciencia</label>
               <div className="grid grid-cols-3 gap-1">
-                {(['idle', 'listening', 'thinking', 'processing', 'projecting', 'speaking'] as AtlasPresenceState[]).map((st) => (
+                {(['idle', 'processing', 'response', 'listening', 'thinking', 'projecting'] as AtlasPresenceState[]).map((st) => (
                   <button
                     key={st}
                     onClick={() => handleSetState(st)}
-                    className={`px-2 py-1 text-[10px] rounded border capitalize text-center truncate transition-colors ${
+                    className={`px-2 py-1 text-[10px] rounded border capitalize text-center truncate transition-colors cursor-pointer ${
                       currentState === st
-                        ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200 font-semibold'
+                        ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200 font-semibold shadow-sm'
                         : 'border-slate-800 text-slate-400 hover:bg-slate-800'
                     }`}
                   >
@@ -1161,7 +1182,7 @@ export const AtlasVisualizer: React.FC<AtlasVisualizerProps> = ({
       {/* 4. Center Reactive Activity Subtitle / Prompt Halo */}
       <div className="absolute inset-x-0 bottom-4 flex flex-col items-center justify-center pointer-events-none px-4 z-10">
         {/* Animated Soundwave Frequency spectrum bars */}
-        {(currentState === 'listening' || currentState === 'speaking' || currentState === 'thinking') && (
+        {(currentState === 'listening' || currentState === 'speaking' || currentState === 'thinking' || currentState === 'processing' || currentState === 'response') && (
           <motion.div
             initial={{ opacity: 0, scale: 0.9 }}
             animate={{ opacity: 1, scale: 1 }}
@@ -1174,13 +1195,19 @@ export const AtlasVisualizer: React.FC<AtlasVisualizerProps> = ({
                 className="w-1 rounded-full transition-all duration-100"
                 style={{
                   height: `${Math.max(4, freq * 20)}px`,
-                  backgroundColor: palette.secondary,
+                  backgroundColor: currentState === 'processing' ? '#c084fc' : currentState === 'response' ? '#34d399' : palette.secondary,
                   opacity: 0.4 + freq * 0.6,
                 }}
               />
             ))}
             <span className="text-[10px] text-cyan-300 font-mono ml-1.5">
-              {currentState === 'listening' ? 'ESCUDRIÑANDO...' : currentState === 'thinking' ? 'ORQUESTANDO...' : 'PROYECTANDO'}
+              {currentState === 'listening'
+                ? 'ESCUDRIÑANDO AUDIO...'
+                : currentState === 'processing' || currentState === 'thinking'
+                ? 'PROCESANDO CUÁNTICO...'
+                : currentState === 'response' || currentState === 'speaking'
+                ? 'EMITIENDO RESPUESTA...'
+                : 'ORQUESTANDO'}
             </span>
           </motion.div>
         )}

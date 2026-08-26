@@ -4,7 +4,7 @@ export interface AtlasUserPreferences {
   preferredBranchId?: string;
   autoVoiceSynthesis: boolean;
   proactiveAlerts: boolean;
-  defaultView: 'executive_brief' | 'calendar_tasks' | 'form_builder' | 'branch_radar' | 'code_audit';
+  defaultView: 'calendar_tasks' | 'branch_radar' | 'form_builder' | 'code_audit' | 'culture_matrix' | 'docfx_validator';
   particleDensity: 'normal' | 'high' | 'ultra';
   updatedAt: string;
 }
@@ -36,10 +36,26 @@ export interface AtlasAgentAction {
   executedByName: string;
 }
 
+export interface AtlasNotificationEvent {
+  id: string;
+  type: 'incidencia_critica' | 'caja_descuadre' | 'cocina_peps' | 'recordatorio_calendar' | 'meta_alcanzada';
+  title: string;
+  description: string;
+  branchName?: string;
+  branchId?: string;
+  priority: 'critica' | 'alta' | 'media' | 'info';
+  timestamp: string;
+  sourceDocId?: string;
+  suggestedActionText?: string;
+  suggestedMeetingTitle?: string;
+  resolved?: boolean;
+}
+
 export interface AtlasConversationContext {
   activeSessionId: string;
   recentTopics: string[];
   unresolvedQueries: string[];
+  knownAlertIds?: string[];
   lastExecutiveSummary?: string;
   lastActiveBranchId?: string;
   lastInteractionTimestamp: string;

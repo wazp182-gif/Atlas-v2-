@@ -77,7 +77,7 @@ export const DEFAULT_USER_PREFERENCES: AtlasUserPreferences = {
   preferredBranchId: 'todas',
   autoVoiceSynthesis: false,
   proactiveAlerts: true,
-  defaultView: 'executive_brief',
+  defaultView: 'calendar_tasks',
   particleDensity: 'normal',
   updatedAt: new Date().toISOString(),
 };
@@ -356,7 +356,6 @@ export function subscribeToAtlasMemory(
   onError?: (error: Error) => void
 ): () => void {
   if (!userId) return () => {};
-  const docPath = `${MEMORY_COLLECTION}/${userId}`;
   const memoryRef = doc(db, MEMORY_COLLECTION, userId);
 
   return onSnapshot(
@@ -369,10 +368,10 @@ export function subscribeToAtlasMemory(
       }
     },
     (err) => {
+      console.warn('Atlas memory snapshot warning:', err);
       if (onError) {
         onError(err);
       }
-      handleFirestoreError(err, OperationType.GET, docPath);
     }
   );
 }
@@ -386,7 +385,6 @@ export function subscribeToAtlasActions(
   maxLimit: number = 15
 ): () => void {
   if (!userId) return () => {};
-  const subcollectionPath = `${MEMORY_COLLECTION}/${userId}/actions`;
   const actionsRef = collection(db, MEMORY_COLLECTION, userId, 'actions');
   const q = query(actionsRef, orderBy('timestamp', 'desc'), limit(maxLimit));
 
@@ -400,7 +398,10 @@ export function subscribeToAtlasActions(
       onUpdate(list);
     },
     (err) => {
-      handleFirestoreError(err, OperationType.LIST, subcollectionPath);
+      console.warn('Atlas actions snapshot warning:', err);
     }
   );
 }
+
+export { useAtlasMemory } from '../hooks/useAtlasMemory';
+export type { UseAtlasMemoryOptions, UseAtlasMemoryReturn } from '../hooks/useAtlasMemory';

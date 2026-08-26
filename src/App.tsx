@@ -26,15 +26,28 @@ import { ModuloCocina } from './components/ModuloCocina';
 import { ModuloEtiquetas } from './components/ModuloEtiquetas';
 import { ModuloIncidencias } from './components/ModuloIncidencias';
 import { ModuloSeguridadUsuarios } from './components/ModuloSeguridadUsuarios';
+import { ModuloWebAgentSkills } from './components/ModuloWebAgentSkills';
 import { ConteoCaja, VentaHora, IncidenciaCapitan, ChecklistCocina, EtiquetaRegistro } from './types/operaciones';
 import { collection, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
 import { db } from './lib/firebase';
+import { AtlasDirector, NotificationDoc, AtlasCalendarService } from './components/AtlasDirector';
+import { getStoredCalendarToken } from './lib/googleCalendarService';
+import { CheckCheck, Calendar, BellRing, Globe } from 'lucide-react';
 
 export function App() {
   const { user, userProfile, loading, logout, isAdmin, isAdminZona } = useAuth();
   const [activeTab, setActiveTab] = useState<string>('dashboard');
   const [isDark, setIsDark] = useState<boolean>(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  // Calendar Access Token & Toasts
+  const [calendarToken, setCalendarToken] = useState<string>(() => getStoredCalendarToken() || '');
+  const [activeToasts, setActiveToasts] = useState<NotificationDoc[]>([]);
+  const [scheduleSuggestion, setScheduleSuggestion] = useState<{
+    message: string;
+    slot: { start: Date; end: Date };
+  } | null>(null);
+  const [scheduleSuccessMsg, setScheduleSuccessMsg] = useState<string | null>(null);
 
   // Firestore Real-time collections
   const [conteos, setConteos] = useState<ConteoCaja[]>([]);
@@ -110,6 +123,7 @@ export function App() {
 
   const navItems = [
     { id: 'dashboard', label: 'Atlas Director', icon: Sparkles },
+    { id: 'web_agent', label: 'Agente Web & Skills', icon: Globe },
     { id: 'tablero', label: 'Tablero Operativo', icon: Layers },
     { id: 'conteos', label: 'Caja & Arqueos', icon: DollarSign },
     { id: 'ventas', label: 'Ventas por Hora', icon: TrendingUp },
@@ -230,6 +244,10 @@ export function App() {
           />
         )}
 
+        {activeTab === 'web_agent' && (
+          <ModuloWebAgentSkills />
+        )}
+
         {activeTab === 'tablero' && (
           <DashboardOverview
             onNavigate={(mod) => setActiveTab(mod)}
@@ -265,6 +283,131 @@ export function App() {
           <ModuloSeguridadUsuarios />
         )}
       </main>
+
+      {/* Atlas Director Background Sync & Notification Listener */}
+      {user && (
+        <AtlasDirector
+          userId={user.uid}
+          calendarAccessToken={calendarToken}
+          onShowToast={(notif) => {
+            setActiveToasts((prev) => [notif, ...prev.slice(0, 4)]);
+            setTimeout(() => {
+              setActiveToasts((prev) => prev.filter((t) => t.id !== notif.id));
+            }, 8000);
+          }}
+          onSuggestSchedule={(message, slot) => {
+            setScheduleSuggestion({ message, slot });
+          }}
+        />
+      )}
+
+      {/* 🔔 Floating Reactive Notification Toasts */}
+      {activeToasts.length > 0 && (
+        <div className="fixed bottom-16 right-4 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none">
+          {activeToasts.map((toast) => (
+            <div
+              key={toast.id}
+              className="pointer-events-auto p-4 rounded-xl bg-zinc-900/95 border border-zinc-700 shadow-2xl backdrop-blur-md text-zinc-100 flex items-start gap-3 animate-slideUp"
+            >
+              <div
+                className={`p-2 rounded-lg shrink-0 ${
+                  toast.type === 'cierre_caja'
+                    ? 'bg-amber-950 text-amber-400 border border-amber-800'
+                    : toast.type === 'tarea_urgente'
+                    ? 'bg-rose-950 text-rose-400 border border-rose-800'
+                    : 'bg-cyan-950 text-cyan-400 border border-cyan-800'
+                }`}
+              >
+                <BellRing className="h-4 w-4 animate-bounce" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <h5 className="text-xs font-bold text-zinc-100 line-clamp-1">{toast.title}</h5>
+                <p className="text-[11px] text-zinc-300 mt-0.5 leading-relaxed line-clamp-2">{toast.message}</p>
+              </div>
+              <button
+                onClick={() => setActiveToasts((prev) => prev.filter((t) => t.id !== toast.id))}
+                className="text-zinc-500 hover:text-zinc-300 p-0.5"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 📅 Atlas Smart Schedule Suggestion Banner */}
+      {scheduleSuggestion && (
+        <div className="fixed bottom-16 left-4 z-50 max-w-md w-full p-4 rounded-2xl bg-zinc-900 border border-cyan-500/50 shadow-2xl shadow-cyan-950/60 text-zinc-100 space-y-3 backdrop-blur-md animate-fadeIn">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="p-1.5 rounded-lg bg-cyan-950 text-cyan-400 border border-cyan-800">
+                <Calendar className="h-4 w-4" />
+              </span>
+              <h5 className="text-xs font-bold text-cyan-300">Atlas Director • Propuesta de Agenda</h5>
+            </div>
+            <button
+              onClick={() => setScheduleSuggestion(null)}
+              className="text-zinc-400 hover:text-zinc-200"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+
+          <p className="text-xs text-zinc-300 leading-relaxed">
+            {scheduleSuggestion.message}
+          </p>
+
+          <div className="flex items-center justify-end gap-2 pt-1 border-t border-zinc-800">
+            <button
+              onClick={() => setScheduleSuggestion(null)}
+              className="px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium cursor-pointer"
+            >
+              Descartar
+            </button>
+            <button
+              onClick={async () => {
+                try {
+                  const token = calendarToken || getStoredCalendarToken();
+                  if (!token) {
+                    setScheduleSuccessMsg('Conecta tu Google Calendar para confirmar el evento.');
+                    setScheduleSuggestion(null);
+                    return;
+                  }
+                  const service = new AtlasCalendarService(token);
+                  await service.scheduleTimeBlock({
+                    summary: `Auditoría / Tarea Operativa (Atlas Director)`,
+                    description: scheduleSuggestion.message,
+                    start: { dateTime: scheduleSuggestion.slot.start.toISOString() },
+                    end: { dateTime: scheduleSuggestion.slot.end.toISOString() },
+                  });
+                  setScheduleSuccessMsg('¡Bloque de tiempo agendado con éxito en Google Calendar!');
+                  setScheduleSuggestion(null);
+                  setTimeout(() => setScheduleSuccessMsg(null), 5000);
+                } catch (e: any) {
+                  console.error('Error agendando slot:', e);
+                  setScheduleSuccessMsg(`Error: ${e.message || 'No se pudo agendar'}`);
+                  setTimeout(() => setScheduleSuccessMsg(null), 5000);
+                }
+              }}
+              className="px-3 py-1 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold flex items-center gap-1 cursor-pointer shadow-md"
+            >
+              <CheckCheck className="h-3.5 w-3.5" />
+              <span>Confirmar y Agendar</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation feedback toast */}
+      {scheduleSuccessMsg && (
+        <div className="fixed top-16 right-4 z-50 p-3 rounded-xl bg-emerald-950 border border-emerald-500/50 text-emerald-200 text-xs flex items-center gap-2 shadow-xl animate-fadeIn">
+          <CheckCheck className="h-4 w-4 text-emerald-400" />
+          <span>{scheduleSuccessMsg}</span>
+          <button onClick={() => setScheduleSuccessMsg(null)} className="ml-2 text-emerald-400 hover:text-white">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Bottom Status bar */}
       <footer className="border-t border-zinc-200 dark:border-zinc-800 py-3 px-4 sm:px-6 bg-white dark:bg-zinc-900 text-zinc-500 dark:text-zinc-400 text-xs flex flex-col sm:flex-row items-center justify-between gap-2">
