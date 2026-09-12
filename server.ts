@@ -1,11 +1,38 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type } from '@google/genai';
+import {
+  GoogleGenAI,
+  Type,
+  createUserContent,
+  createModelContent,
+  createPartFromFunctionCall,
+  createPartFromFunctionResponse,
+} from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { initializeApp as initializeAdminApp, getApps as getAdminApps, applicationDefault } from 'firebase-admin/app';
+import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
 dotenv.config();
+
+// Firestore Admin access for Atlas' self-managed (autonomous) actions.
+// Uses Application Default Credentials — works natively on Cloud Run's
+// service account; requires `gcloud auth application-default login` for
+// local dev. Failures here only disable autonomous write actions, they
+// never crash the server (Atlas still works as a read-only chat agent).
+const FIREBASE_PROJECT_ID = 'atlas-v1-505407';
+const FIRESTORE_DATABASE_ID = 'ai-studio-agendacraftai-88228244-34b0-45f8-9d06-001ed8595880';
+
+let firestoreDb: FirebaseFirestore.Firestore | null = null;
+try {
+  const adminApp = getAdminApps().length
+    ? getAdminApps()[0]!
+    : initializeAdminApp({ credential: applicationDefault(), projectId: FIREBASE_PROJECT_ID });
+  firestoreDb = getFirestore(adminApp, FIRESTORE_DATABASE_ID);
+} catch (err: any) {
+  console.warn('Firebase Admin init failed — autonomous Firestore actions disabled:', err.message);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,41 +54,187 @@ const defaultAi = new GoogleGenAI({
   },
 });
 
+// ==========================================
+// ATLAS SELF-MANAGED ACTIONS (function calling)
+// ==========================================
+// A single tool Atlas can invoke to actually change operational data
+// instead of only talking about it. Schema shared between providers:
+// Gemini format (Type enum) and OpenAI/NVIDIA format (JSON Schema) are
+// structurally identical for this simple flat-object case.
+const CHECKLIST_TOOL_NAME = 'actualizar_checklist_cocina';
+const CHECKLIST_TOOL_DESCRIPTION =
+  'Actualiza el checklist operativo de cocina más reciente de una sucursal (o crea uno si no existe hoy): rotulación PEPS, calidad de aceite de freidoras, limpieza de superficies, desinfección de vegetales u observaciones. Úsala solo cuando el Director pida explícitamente registrar, corregir o actualizar algo del checklist de cocina — no la uses solo para consultar información.';
+
+const checklistToolParamsGemini = {
+  type: Type.OBJECT,
+  properties: {
+    sucursalNombre: { type: Type.STRING, description: 'Nombre de la sucursal. Si no se especifica, usa "Sucursal Central".' },
+    rotulacionPEPS: { type: Type.BOOLEAN, description: 'true si la rotulación PEPS quedó correcta' },
+    limpiezaSuperficies: { type: Type.BOOLEAN },
+    desinfeccionVegetales: { type: Type.BOOLEAN },
+    aceiteFreidorasCalidad: { type: Type.STRING, description: 'Uno de: optimo, medio, cambiar' },
+    observaciones: { type: Type.STRING },
+  },
+};
+
+const geminiChecklistTool = {
+  functionDeclarations: [
+    { name: CHECKLIST_TOOL_NAME, description: CHECKLIST_TOOL_DESCRIPTION, parameters: checklistToolParamsGemini },
+  ],
+};
+
+const nvidiaChecklistTool = {
+  type: 'function',
+  function: {
+    name: CHECKLIST_TOOL_NAME,
+    description: CHECKLIST_TOOL_DESCRIPTION,
+    parameters: {
+      type: 'object',
+      properties: {
+        sucursalNombre: { type: 'string', description: 'Nombre de la sucursal. Si no se especifica, usa "Sucursal Central".' },
+        rotulacionPEPS: { type: 'boolean', description: 'true si la rotulación PEPS quedó correcta' },
+        limpiezaSuperficies: { type: 'boolean' },
+        desinfeccionVegetales: { type: 'boolean' },
+        aceiteFreidorasCalidad: { type: 'string', description: 'Uno de: optimo, medio, cambiar' },
+        observaciones: { type: 'string' },
+      },
+    },
+  },
+};
+
+// Executes the actual Firestore write for a checklist tool call. Returns a
+// short human-readable result the model can relay back to the Director.
+async function executeChecklistToolCall(args: Record<string, any>): Promise<string> {
+  if (!firestoreDb) {
+    return 'No se pudo actualizar el checklist: Atlas no tiene conexión con la base de datos en este momento.';
+  }
+
+  const sucursalNombre = (args.sucursalNombre || 'Sucursal Central').toString();
+  const fields: Record<string, any> = {};
+  for (const key of ['rotulacionPEPS', 'limpiezaSuperficies', 'desinfeccionVegetales', 'aceiteFreidorasCalidad', 'observaciones']) {
+    if (args[key] !== undefined) fields[key] = args[key];
+  }
+
+  const hasIssue =
+    fields.rotulacionPEPS === false ||
+    fields.limpiezaSuperficies === false ||
+    fields.desinfeccionVegetales === false ||
+    fields.aceiteFreidorasCalidad === 'cambiar';
+  const estado = hasIssue ? 'con_observaciones' : 'completo';
+
+  try {
+    const collection = firestoreDb.collection('cocina_checklists');
+    const snapshot = await collection
+      .where('sucursalNombre', '==', sucursalNombre)
+      .orderBy('creadoEn', 'desc')
+      .limit(1)
+      .get();
+
+    if (!snapshot.empty) {
+      const doc = snapshot.docs[0];
+      await doc.ref.update({
+        ...fields,
+        estado,
+        updatedAt: FieldValue.serverTimestamp(),
+        updatedByAtlas: true,
+      });
+      return `Checklist actualizado (${doc.id}) para ${sucursalNombre}: ${Object.keys(fields).join(', ') || 'sin cambios de campo'}. Estado: ${estado}.`;
+    }
+
+    const newDoc = await collection.add({
+      sucursalId: 'suc-central',
+      sucursalNombre,
+      fecha: new Date().toISOString().split('T')[0],
+      turno: 'operacion',
+      responsableUid: 'atlas-ai',
+      responsableNombre: 'Atlas (Autogestión IA)',
+      temperaturaCamaras: [],
+      limpiezaSuperficies: fields.limpiezaSuperficies ?? true,
+      rotulacionPEPS: fields.rotulacionPEPS ?? true,
+      aceiteFreidorasCalidad: fields.aceiteFreidorasCalidad ?? 'optimo',
+      desinfeccionVegetales: fields.desinfeccionVegetales ?? true,
+      cumplimientoPorcentaje: 0,
+      observaciones: fields.observaciones ?? '',
+      estado,
+      creadoEn: FieldValue.serverTimestamp(),
+      creadoPorAtlas: true,
+    });
+    return `Se creó un nuevo checklist (${newDoc.id}) para ${sucursalNombre} con los datos indicados. Estado: ${estado}.`;
+  } catch (err: any) {
+    console.error('executeChecklistToolCall: Firestore write failed:', err.message);
+    return 'No se pudo actualizar el checklist: error de permisos o conexión con la base de datos. Informa al Director que revise el acceso de Atlas a Firestore.';
+  }
+}
+
 // NVIDIA NIM (OpenAI-compatible) chat completion helper
 async function callNvidiaChat(
   messages: { role: string; content: string }[],
-  options: { temperature?: number; maxTokens?: number; model?: string } = {}
+  options: {
+    temperature?: number;
+    maxTokens?: number;
+    model?: string;
+    // Optional OpenAI-format tool definitions + a handler invoked with
+    // (toolName, parsedArgs) that performs the action and returns a short
+    // text result to relay back to the model. When omitted, behavior is
+    // identical to the original text-only helper.
+    tools?: any[];
+    onToolCall?: (name: string, args: Record<string, any>) => Promise<string>;
+  } = {}
 ): Promise<string> {
   const apiKey = process.env.NVIDIA_API_KEY;
   if (!apiKey) throw new Error('NVIDIA_API_KEY no configurada');
 
-  const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: options.model || process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
-      messages,
-      temperature: options.temperature ?? 0.3,
-      max_tokens: options.maxTokens ?? 1024,
-      // Reasoning models (e.g. Nemotron) default to exposing their chain-of-thought;
-      // Atlas only ever wants the final answer, never the raw reasoning trace.
-      chat_template_kwargs: { enable_thinking: false },
-    }),
-  });
+  const model = options.model || process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b';
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`NVIDIA API error ${response.status}: ${errText}`);
+  const callOnce = async (msgs: any[]) => {
+    const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: msgs,
+        temperature: options.temperature ?? 0.3,
+        max_tokens: options.maxTokens ?? 1024,
+        // Reasoning models (e.g. Nemotron) default to exposing their chain-of-thought;
+        // Atlas only ever wants the final answer, never the raw reasoning trace.
+        chat_template_kwargs: { enable_thinking: false },
+        ...(options.tools ? { tools: options.tools } : {}),
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`NVIDIA API error ${response.status}: ${errText}`);
+    }
+    return response.json();
+  };
+
+  let data = await callOnce(messages);
+  let message = data?.choices?.[0]?.message;
+
+  if (message?.tool_calls?.length && options.onToolCall) {
+    const conversation: any[] = [...messages, message];
+    for (const call of message.tool_calls) {
+      let args: Record<string, any> = {};
+      try {
+        args = JSON.parse(call.function?.arguments || '{}');
+      } catch {
+        // Leave args empty if the model produced malformed JSON.
+      }
+      const result = await options.onToolCall(call.function?.name, args);
+      conversation.push({ role: 'tool', tool_call_id: call.id, content: result });
+    }
+    data = await callOnce(conversation);
+    message = data?.choices?.[0]?.message;
   }
 
-  const data = await response.json();
   // Some reasoning models still return a separate reasoning_content even with thinking
   // disabled; only ever surface `content`, and strip any stray <think>...</think> block
   // a model might inline directly into it.
-  let text: string | undefined = data?.choices?.[0]?.message?.content;
+  let text: string | undefined = message?.content;
   if (text) {
     text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
   }
@@ -1470,7 +1643,8 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
 2. NO menciones ventas, arqueos, cajas, inventarios ni estatus de sistemas a menos que te lo pregunten explícitamente.
 3. Cero frases robóticas ("He procesado tu instrucción...", "Entendido, Director. He recibido..."). Ve directo al grano.
 4. Tono: Ejecutivo, refinado, conciso, inteligente y respetuoso (trátalo de "Director" o "Señor").
-5. Si te pregunta la hora, responde únicamente la hora de forma natural y elegante.`;
+5. Si te pregunta la hora, responde únicamente la hora de forma natural y elegante.
+6. Si el Director pide explícitamente registrar, corregir o actualizar el checklist de cocina (PEPS, aceite, limpieza, desinfección), usa la herramienta ${CHECKLIST_TOOL_NAME} para aplicar el cambio de verdad — no solo lo describas.`;
 
   try {
     let respuesta_ia: string | undefined;
@@ -1484,7 +1658,11 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
             { role: 'system', content: systemInstruction },
             { role: 'user', content: requestText },
           ],
-          { temperature: 0.2 }
+          {
+            temperature: 0.2,
+            tools: [nvidiaChecklistTool],
+            onToolCall: (name, args) => (name === CHECKLIST_TOOL_NAME ? executeChecklistToolCall(args) : Promise.resolve('Herramienta desconocida.')),
+          }
         );
         modelUsed = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b';
       } catch (nvErr: any) {
@@ -1494,25 +1672,38 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
 
     if (!respuesta_ia) {
       const aiClient = defaultAi;
+      const geminiConfig = { systemInstruction, temperature: 0.2, tools: [geminiChecklistTool] };
       let response;
 
       try {
         response = await aiClient.models.generateContent({
           model: 'gemini-3.7-flash',
           contents: requestText,
-          config: {
-            systemInstruction,
-            temperature: 0.2,
-          },
+          config: geminiConfig,
         });
       } catch (modelErr: any) {
         response = await aiClient.models.generateContent({
           model: 'gemini-3.1-flash-lite',
           contents: requestText,
-          config: {
-            systemInstruction,
-            temperature: 0.2,
-          },
+          config: geminiConfig,
+        });
+      }
+
+      const call = response?.functionCalls?.[0];
+      if (call?.name === CHECKLIST_TOOL_NAME) {
+        const toolResult = await executeChecklistToolCall(call.args || {});
+        // Reuse the model's own content object (not a hand-rebuilt part) so any
+        // thoughtSignature Gemini attached to the function call is preserved —
+        // required for follow-up turns with tool results, or the API rejects it.
+        const modelTurn = response?.candidates?.[0]?.content ?? createModelContent([createPartFromFunctionCall(call.name, call.args || {})]);
+        response = await aiClient.models.generateContent({
+          model: 'gemini-3.7-flash',
+          contents: [
+            createUserContent(requestText),
+            modelTurn,
+            createUserContent([createPartFromFunctionResponse(call.id || call.name, call.name, { result: toolResult })]),
+          ],
+          config: { systemInstruction, temperature: 0.2 },
         });
       }
 
@@ -1584,6 +1775,80 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
       fechaStr,
       fallbackMode: true,
     });
+  }
+});
+
+// Autonomous background scan — meant to be hit by Cloud Scheduler on a timer,
+// independent of any browser being open. Looks for critical incidents and
+// kitchen checklist issues, and writes a proactive notification doc for each
+// one not already surfaced, so it appears as a toast for whoever is logged in.
+app.get('/api/atlas/autonomous-scan', async (_req, res) => {
+  if (!firestoreDb) {
+    return res.status(503).json({ error: 'Firestore no disponible; escaneo autónomo deshabilitado.' });
+  }
+
+  try {
+    const notificationsCreated: string[] = [];
+
+    const incidenciasSnap = await firestoreDb
+      .collection('incidencias_capitanes')
+      .orderBy('fecha', 'desc')
+      .limit(50)
+      .get();
+
+    for (const doc of incidenciasSnap.docs) {
+      const data = doc.data();
+      const isCritical = data.prioridad === 'critica' || data.prioridad === 'alta';
+      const isUnresolved = data.estado !== 'resuelta' && data.estado !== 'resuelto';
+      if (!isCritical || !isUnresolved) continue;
+
+      const notifId = `auto-inc-${doc.id}`;
+      const existing = await firestoreDb.collection('notificaciones').doc(notifId).get();
+      if (existing.exists) continue;
+
+      await firestoreDb.collection('notificaciones').doc(notifId).set({
+        recipientId: 'director-master',
+        type: 'tarea_urgente',
+        title: `Incidencia ${String(data.prioridad).toUpperCase()}: ${data.titulo || 'Sin título'}`,
+        message: `Detectada por escaneo autónomo de Atlas en ${data.sucursalNombre || 'sucursal'}.`,
+        status: 'pending',
+        createdAt: FieldValue.serverTimestamp(),
+        createdByAtlas: true,
+      });
+      notificationsCreated.push(notifId);
+    }
+
+    const checklistsSnap = await firestoreDb
+      .collection('cocina_checklists')
+      .orderBy('creadoEn', 'desc')
+      .limit(50)
+      .get();
+
+    for (const doc of checklistsSnap.docs) {
+      const data = doc.data();
+      const hasIssue = data.rotulacionPEPS === false || data.aceiteFreidorasCalidad === 'cambiar';
+      if (!hasIssue) continue;
+
+      const notifId = `auto-checklist-${doc.id}`;
+      const existing = await firestoreDb.collection('notificaciones').doc(notifId).get();
+      if (existing.exists) continue;
+
+      await firestoreDb.collection('notificaciones').doc(notifId).set({
+        recipientId: 'director-master',
+        type: 'alerta',
+        title: `Alerta de Inocuidad Cocina — ${data.sucursalNombre || 'Sucursal'}`,
+        message: 'Rotulación PEPS o calidad de aceite requiere atención (detectado por escaneo autónomo de Atlas).',
+        status: 'pending',
+        createdAt: FieldValue.serverTimestamp(),
+        createdByAtlas: true,
+      });
+      notificationsCreated.push(notifId);
+    }
+
+    return res.json({ success: true, scannedAt: new Date().toISOString(), notificationsCreated });
+  } catch (error: any) {
+    console.error('autonomous-scan failed:', error);
+    return res.status(500).json({ error: 'Fallo el escaneo autónomo.', detail: error.message });
   }
 });
 
