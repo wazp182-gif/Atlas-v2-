@@ -1530,6 +1530,8 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
       modelUsed,
     });
   } catch (error: any) {
+    console.error('jarvis-command: both NVIDIA and Gemini failed, using heuristic fallback:', error);
+
     // Cognitive NLP executive fallback solver for uninterrupted Jarvis performance
     let fallbackText = `A su servicio, Señor.`;
     const lower = requestText.toLowerCase();
