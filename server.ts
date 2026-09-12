@@ -46,6 +46,9 @@ async function callNvidiaChat(
       messages,
       temperature: options.temperature ?? 0.3,
       max_tokens: options.maxTokens ?? 1024,
+      // Reasoning models (e.g. Nemotron) default to exposing their chain-of-thought;
+      // Atlas only ever wants the final answer, never the raw reasoning trace.
+      chat_template_kwargs: { enable_thinking: false },
     }),
   });
 
@@ -55,7 +58,13 @@ async function callNvidiaChat(
   }
 
   const data = await response.json();
-  const text = data?.choices?.[0]?.message?.content;
+  // Some reasoning models still return a separate reasoning_content even with thinking
+  // disabled; only ever surface `content`, and strip any stray <think>...</think> block
+  // a model might inline directly into it.
+  let text: string | undefined = data?.choices?.[0]?.message?.content;
+  if (text) {
+    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  }
   if (!text) throw new Error('NVIDIA API: respuesta vacía o sin choices[0].message.content');
   return text;
 }
