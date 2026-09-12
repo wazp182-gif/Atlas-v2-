@@ -42,7 +42,7 @@ async function callNvidiaChat(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: options.model || process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct',
+      model: options.model || process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
       messages,
       temperature: options.temperature ?? 0.3,
       max_tokens: options.maxTokens ?? 1024,
@@ -1303,7 +1303,7 @@ Instrucciones obligatorias:
           text: textOutput,
           grounding: { webSearchQueries: [], sources: [], groundingChunks: [] },
           suggestedActions: extractSuggestedActions(textOutput),
-          modelUsed: process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct',
+          modelUsed: process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
           roleUsed: role,
         });
       } catch (nvErr: any) {
@@ -1371,7 +1371,7 @@ Instrucciones obligatorias:
           text: textOutput,
           grounding: { webSearchQueries: [], sources: [], groundingChunks: [] },
           suggestedActions: extractSuggestedActions(textOutput),
-          modelUsed: process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct',
+          modelUsed: process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
           roleUsed: role,
         });
       } catch (nvErr: any) {
@@ -1477,7 +1477,7 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
           ],
           { temperature: 0.2 }
         );
-        modelUsed = process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct';
+        modelUsed = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b';
       } catch (nvErr: any) {
         console.warn('NVIDIA jarvis-command falló, usando Gemini como respaldo:', nvErr.message);
       }
@@ -1651,7 +1651,7 @@ Estructura tu respuesta en 4 secciones claras:
             { id: 'step-2', title: 'Síntesis con NVIDIA NIM (sin búsqueda en vivo)', status: 'completed', actionType: 'synthesize', details: 'Google Search no disponible en este modo; respuesta generada desde conocimiento del modelo.' },
             { id: 'step-3', title: 'Generación de entregable accionable', status: 'completed', actionType: 'export', details: 'Checklist y recomendaciones listas para aplicar.' },
           ],
-          modelUsed: process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct',
+          modelUsed: process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
         });
       } catch (nvErr: any) {
         console.warn('NVIDIA web-agent/task-execute (respaldo) también falló:', nvErr.message);
