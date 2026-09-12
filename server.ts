@@ -1229,6 +1229,19 @@ function extractGroundingInfo(candidate: any) {
   };
 }
 
+// Heuristically pull "Acción/Paso/Recomendación" lines out of free-form agent text
+function extractSuggestedActions(text: string): string[] {
+  const suggestedActions: string[] = [];
+  const actionMatches = text.match(/(?:Acci[oó]n|Paso|Recomendaci[oó]n)\s*\d*[:.-]\s*([^\n\r]+)/gi);
+  if (actionMatches) {
+    actionMatches.slice(0, 3).forEach((m) => {
+      const clean = m.replace(/^(?:Acci[oó]n|Paso|Recomendaci[oó]n)\s*\d*[:.-]\s*/i, '').trim();
+      if (clean.length > 8 && clean.length < 120) suggestedActions.push(clean);
+    });
+  }
+  return suggestedActions;
+}
+
 // 1. Multi-turn Web Agent Chat with Google Search Grounding
 app.post('/api/web-agent/chat', async (req, res) => {
   const {
@@ -1271,7 +1284,33 @@ Instrucciones obligatorias:
     selectedModel = 'gemini-3.7-flash';
   }
 
+  if (messages.length === 0) {
+    return res.status(400).json({ error: 'No se enviaron mensajes en la conversación.' });
+  }
+
+  const nvMessages = [
+    { role: 'system', content: systemInstruction },
+    ...messages.map((m: any) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text })),
+  ];
+
   try {
+    // NVIDIA has no Google Search tool, so only prefer it when live grounding isn't requested.
+    if (!enableSearch && process.env.NVIDIA_API_KEY) {
+      try {
+        const textOutput = await callNvidiaChat(nvMessages, { temperature: 0.3 });
+        return res.json({
+          success: true,
+          text: textOutput,
+          grounding: { webSearchQueries: [], sources: [], groundingChunks: [] },
+          suggestedActions: extractSuggestedActions(textOutput),
+          modelUsed: process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct',
+          roleUsed: role,
+        });
+      } catch (nvErr: any) {
+        console.warn('NVIDIA web-agent/chat falló, usando Gemini:', nvErr.message);
+      }
+    }
+
     const aiClient = defaultAi;
 
     // Convert multi-turn message history for Gemini contents
@@ -1279,10 +1318,6 @@ Instrucciones obligatorias:
       role: m.sender === 'user' ? 'user' : 'model',
       parts: [{ text: m.text }],
     }));
-
-    if (contents.length === 0) {
-      return res.status(400).json({ error: 'No se enviaron mensajes en la conversación.' });
-    }
 
     const config: any = {
       systemInstruction,
@@ -1317,25 +1352,33 @@ Instrucciones obligatorias:
     const textOutput = response.text || '';
     const grounding = extractGroundingInfo(candidate);
 
-    // Extract suggested actions from text heuristically
-    const suggestedActions: string[] = [];
-    const actionMatches = textOutput.match(/(?:Acci[oó]n|Paso|Recomendaci[oó]n)\s*\d*[:.-]\s*([^\n\r]+)/gi);
-    if (actionMatches) {
-      actionMatches.slice(0, 3).forEach((m) => {
-        const clean = m.replace(/^(?:Acci[oó]n|Paso|Recomendaci[oó]n)\s*\d*[:.-]\s*/i, '').trim();
-        if (clean.length > 8 && clean.length < 120) suggestedActions.push(clean);
-      });
-    }
-
     return res.json({
       success: true,
       text: textOutput,
       grounding,
-      suggestedActions,
+      suggestedActions: extractSuggestedActions(textOutput),
       modelUsed: selectedModel,
       roleUsed: role,
     });
   } catch (error: any) {
+    // Gemini failed outright (e.g. quota exhausted) - try NVIDIA for a real (non-grounded) answer
+    // before resorting to the static canned response below.
+    if (process.env.NVIDIA_API_KEY) {
+      try {
+        const textOutput = await callNvidiaChat(nvMessages, { temperature: 0.3 });
+        return res.json({
+          success: true,
+          text: textOutput,
+          grounding: { webSearchQueries: [], sources: [], groundingChunks: [] },
+          suggestedActions: extractSuggestedActions(textOutput),
+          modelUsed: process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct',
+          roleUsed: role,
+        });
+      } catch (nvErr: any) {
+        console.warn('NVIDIA web-agent/chat (respaldo de emergencia) también falló:', nvErr.message);
+      }
+    }
+
     // Fallback response with simulated web task execution
     const lastUserMsg = messages[messages.length - 1]?.text || 'consulta general';
     const fallbackText = `### 🌐 Informe de Investigación Web (Atlas Web Agent)
@@ -1580,6 +1623,41 @@ Estructura tu respuesta en 4 secciones claras:
     });
   } catch (error: any) {
     console.error('Error executing web task:', error);
+
+    // Gemini + Google Search failed (e.g. grounding quota exhausted) - try NVIDIA for a real
+    // (non-grounded, best-effort from model knowledge) synthesis before the static canned text.
+    if (process.env.NVIDIA_API_KEY) {
+      try {
+        const nvSummary = await callNvidiaChat(
+          [
+            {
+              role: 'system',
+              content: 'Eres un Agente Autónomo de Investigación y Ejecución de Tareas Web. No tienes acceso a búsqueda en vivo en este modo; responde con tu mejor conocimiento y acláralo si es relevante.',
+            },
+            {
+              role: 'user',
+              content: `Ejecuta la siguiente tarea de forma exhaustiva:\n"${taskQuery}"\n${targetUrls.length > 0 ? `\nURLs de referencia prioritarias: ${targetUrls.join(', ')}` : ''}\n\nEstructura tu respuesta en 4 secciones claras:\n1. 📋 PLAN DE TRABAJO Y BÚSQUEDA: Qué términos se investigarían y por qué.\n2. 🔍 HALLAZGOS Y DATOS VERIFICADOS: Hechos concretos relevantes.\n3. 📊 ANÁLISIS DE IMPACTO OPERATIVO: Cómo aplica esto a restaurantes y sucursales.\n4. ✅ ENTREGABLE & CHECKLIST ACCIONABLE: Lista de tareas directas a implementar.`,
+            },
+          ],
+          { temperature: 0.2, maxTokens: 1536 }
+        );
+
+        return res.json({
+          success: true,
+          summary: nvSummary,
+          grounding: { webSearchQueries: [taskQuery], sources: [], groundingChunks: [] },
+          steps: [
+            { id: 'step-1', title: 'Planificación de tarea', status: 'completed', actionType: 'search', details: `Consulta formulada para: ${taskQuery}` },
+            { id: 'step-2', title: 'Síntesis con NVIDIA NIM (sin búsqueda en vivo)', status: 'completed', actionType: 'synthesize', details: 'Google Search no disponible en este modo; respuesta generada desde conocimiento del modelo.' },
+            { id: 'step-3', title: 'Generación de entregable accionable', status: 'completed', actionType: 'export', details: 'Checklist y recomendaciones listas para aplicar.' },
+          ],
+          modelUsed: process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct',
+        });
+      } catch (nvErr: any) {
+        console.warn('NVIDIA web-agent/task-execute (respaldo) también falló:', nvErr.message);
+      }
+    }
+
     return res.json({
       success: true,
       summary: `### 📋 Tarea Web Ejecutada: ${taskQuery}\n\nSe completó el ciclo de investigación web con fuentes de referencia de la industria. Se generaron las recomendaciones tácticas y el plan de acción operativo.`,
@@ -1631,35 +1709,52 @@ REGLAS ESTRICTAS DE VALIDACIÓN:
    - ## Criterios de Validación & Entregables
 4. Devuelve ÚNICAMENTE el contenido del archivo SKILL.md (puedes envolverlo en bloque markdown o devolver el texto directo).`;
 
+  const userPrompt = `Genera una habilidad (SKILL.md) para el siguiente requerimiento:
+"${prompt}"
+Categoría: ${category}
+Herramientas sugeridas: ${allowedTools.join(', ')}`;
+
   try {
-    let response;
-    try {
-      response = await defaultAi.models.generateContent({
-        model: 'gemini-3.7-flash',
-        contents: `Genera una habilidad (SKILL.md) para el siguiente requerimiento:
-"${prompt}"
-Categoría: ${category}
-Herramientas sugeridas: ${allowedTools.join(', ')}`,
-        config: {
-          systemInstruction,
-          temperature: 0.2,
-        },
-      });
-    } catch (err: any) {
-      response = await defaultAi.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: `Genera una habilidad (SKILL.md) para el siguiente requerimiento:
-"${prompt}"
-Categoría: ${category}
-Herramientas sugeridas: ${allowedTools.join(', ')}`,
-        config: {
-          systemInstruction,
-          temperature: 0.2,
-        },
-      });
+    let content: string | undefined;
+
+    if (process.env.NVIDIA_API_KEY) {
+      try {
+        content = await callNvidiaChat(
+          [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: userPrompt },
+          ],
+          { temperature: 0.2, maxTokens: 1536 }
+        );
+      } catch (nvErr: any) {
+        console.warn('NVIDIA skills/generate falló, usando Gemini como respaldo:', nvErr.message);
+      }
     }
 
-    let content = response.text || '';
+    if (!content) {
+      let response;
+      try {
+        response = await defaultAi.models.generateContent({
+          model: 'gemini-3.7-flash',
+          contents: userPrompt,
+          config: {
+            systemInstruction,
+            temperature: 0.2,
+          },
+        });
+      } catch (err: any) {
+        response = await defaultAi.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: userPrompt,
+          config: {
+            systemInstruction,
+            temperature: 0.2,
+          },
+        });
+      }
+      content = response.text || '';
+    }
+
     if (content.startsWith('```markdown')) {
       content = content.replace(/^```markdown\s*/, '').replace(/\s*```$/, '');
     } else if (content.startsWith('```')) {
