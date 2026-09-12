@@ -27,6 +27,39 @@ const defaultAi = new GoogleGenAI({
   },
 });
 
+// NVIDIA NIM (OpenAI-compatible) chat completion helper
+async function callNvidiaChat(
+  messages: { role: string; content: string }[],
+  options: { temperature?: number; maxTokens?: number; model?: string } = {}
+): Promise<string> {
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) throw new Error('NVIDIA_API_KEY no configurada');
+
+  const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: options.model || process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct',
+      messages,
+      temperature: options.temperature ?? 0.3,
+      max_tokens: options.maxTokens ?? 1024,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`NVIDIA API error ${response.status}: ${errText}`);
+  }
+
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) throw new Error('NVIDIA API: respuesta vacía o sin choices[0].message.content');
+  return text;
+}
+
 // Helper to sanitize and normalize agenda JSON
 function cleanJsonOutput(text: string): any {
   let cleaned = text.trim();
@@ -1388,30 +1421,52 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
 5. Si te pregunta la hora, responde únicamente la hora de forma natural y elegante.`;
 
   try {
-    const aiClient = defaultAi;
-    let response;
+    let respuesta_ia: string | undefined;
+    let modelUsed = 'gemini-3.7-flash';
 
-    try {
-      response = await aiClient.models.generateContent({
-        model: 'gemini-3.7-flash',
-        contents: requestText,
-        config: {
-          systemInstruction,
-          temperature: 0.2,
-        },
-      });
-    } catch (modelErr: any) {
-      response = await aiClient.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: requestText,
-        config: {
-          systemInstruction,
-          temperature: 0.2,
-        },
-      });
+    // Prefer NVIDIA NIM when configured; fall back to Gemini transparently on any failure.
+    if (process.env.NVIDIA_API_KEY) {
+      try {
+        respuesta_ia = await callNvidiaChat(
+          [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: requestText },
+          ],
+          { temperature: 0.2 }
+        );
+        modelUsed = process.env.NVIDIA_MODEL || 'meta/llama-3.1-70b-instruct';
+      } catch (nvErr: any) {
+        console.warn('NVIDIA jarvis-command falló, usando Gemini como respaldo:', nvErr.message);
+      }
     }
 
-    const respuesta_ia = response?.text?.trim() || `A su servicio, Señor. Son las ${horaStr}.`;
+    if (!respuesta_ia) {
+      const aiClient = defaultAi;
+      let response;
+
+      try {
+        response = await aiClient.models.generateContent({
+          model: 'gemini-3.7-flash',
+          contents: requestText,
+          config: {
+            systemInstruction,
+            temperature: 0.2,
+          },
+        });
+      } catch (modelErr: any) {
+        response = await aiClient.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: requestText,
+          config: {
+            systemInstruction,
+            temperature: 0.2,
+          },
+        });
+      }
+
+      respuesta_ia = response?.text?.trim() || `A su servicio, Señor. Son las ${horaStr}.`;
+      modelUsed = 'gemini-3.7-flash';
+    }
 
     return res.json({
       status: 'PROCESSED',
@@ -1420,7 +1475,7 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
       text: respuesta_ia,
       horaStr,
       fechaStr,
-      modelUsed: 'gemini-3.7-flash',
+      modelUsed,
     });
   } catch (error: any) {
     // Cognitive NLP executive fallback solver for uninterrupted Jarvis performance
