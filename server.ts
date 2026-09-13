@@ -166,6 +166,226 @@ async function executeChecklistToolCall(args: Record<string, any>): Promise<stri
   }
 }
 
+// ==========================================
+// ATLAS MEMORY ENGINE (Firestore vector search)
+// ==========================================
+// Semantic memory lives in one collection, each note carrying its own
+// embedding, queried with findNearest(). Operational records (checklists,
+// incidencias) deliberately stay out of here and are read with exact queries —
+// embedding what can be matched exactly only costs precision.
+const MEMORY_COLLECTION = 'atlas_memoria';
+const MEMORY_EMBED_MODEL = 'gemini-embedding-001';
+// Firestore vector indexes cap at 2048 dimensions, so the model's 3072-dim
+// default cannot be indexed; 768 keeps the index small at negligible recall cost.
+const MEMORY_DIMENSIONS = 768;
+const MEMORY_TIPOS = ['decision', 'aprendizaje', 'preferencia', 'contexto'];
+
+type MemoriaHit = { id: string; texto: string; tipo: string; etiquetas: string[]; distancia: number | null };
+
+async function embedMemoryText(text: string, taskType: 'RETRIEVAL_DOCUMENT' | 'RETRIEVAL_QUERY'): Promise<number[]> {
+  const response = await defaultAi.models.embedContent({
+    model: MEMORY_EMBED_MODEL,
+    contents: text,
+    config: { taskType, outputDimensionality: MEMORY_DIMENSIONS },
+  });
+  const values = response.embeddings?.[0]?.values;
+  if (!values?.length) throw new Error('El modelo de embeddings no devolvió ningún vector.');
+  return values;
+}
+
+async function saveMemory(input: {
+  texto: string;
+  tipo?: string;
+  etiquetas?: string[];
+  sucursalNombre?: string;
+  origen?: string;
+}): Promise<{ id: string; tipo: string }> {
+  if (!firestoreDb) throw new Error('Firestore no disponible.');
+
+  const texto = input.texto.trim();
+  if (!texto) throw new Error('El texto de la memoria está vacío.');
+
+  const tipo = MEMORY_TIPOS.includes(input.tipo ?? '') ? input.tipo! : 'contexto';
+  const embedding = await embedMemoryText(texto, 'RETRIEVAL_DOCUMENT');
+
+  const doc = await firestoreDb.collection(MEMORY_COLLECTION).add({
+    texto,
+    tipo,
+    etiquetas: Array.isArray(input.etiquetas) ? input.etiquetas.slice(0, 12).map(String) : [],
+    sucursalNombre: input.sucursalNombre ?? null,
+    origen: input.origen ?? 'atlas',
+    embedding: FieldValue.vector(embedding),
+    dimensiones: MEMORY_DIMENSIONS,
+    creadoEn: FieldValue.serverTimestamp(),
+  });
+
+  return { id: doc.id, tipo };
+}
+
+async function searchMemory(consulta: string, limit = 4): Promise<MemoriaHit[]> {
+  if (!firestoreDb) throw new Error('Firestore no disponible.');
+
+  const queryVector = await embedMemoryText(consulta, 'RETRIEVAL_QUERY');
+  const snapshot = await firestoreDb
+    .collection(MEMORY_COLLECTION)
+    .findNearest({
+      vectorField: 'embedding',
+      queryVector,
+      limit: Math.min(Math.max(limit, 1), 20),
+      distanceMeasure: 'COSINE',
+      distanceResultField: 'distancia',
+    })
+    .get();
+
+  return snapshot.docs.map((doc) => {
+    const data = doc.data();
+    return {
+      id: doc.id,
+      texto: String(data.texto ?? ''),
+      tipo: String(data.tipo ?? 'contexto'),
+      etiquetas: Array.isArray(data.etiquetas) ? data.etiquetas.map(String) : [],
+      distancia: typeof data.distancia === 'number' ? data.distancia : null,
+    };
+  });
+}
+
+const MEMORY_SAVE_TOOL_NAME = 'guardar_memoria';
+const MEMORY_SAVE_TOOL_DESCRIPTION =
+  'Guarda un hecho duradero en la memoria de largo plazo de Atlas: una decisión del Director, un aprendizaje operativo, una preferencia suya o contexto del negocio que deba recordarse en conversaciones futuras. Úsala cuando el Director indique algo que deba persistir ("recuerda que...", "de ahora en adelante...", "mi preferencia es..."), no para datos operativos del día que ya viven en el checklist o en incidencias.';
+const MEMORY_SEARCH_TOOL_NAME = 'recordar_memoria';
+const MEMORY_SEARCH_TOOL_DESCRIPTION =
+  'Busca en la memoria de largo plazo de Atlas por significado, no por palabra exacta. Úsala cuando el Director pregunte qué se decidió antes, qué se aprendió o cuáles son sus preferencias, o cuando necesites contexto histórico que no está en la conversación actual.';
+
+const memorySaveParamsGemini = {
+  type: Type.OBJECT,
+  properties: {
+    texto: { type: Type.STRING, description: 'El hecho a recordar, redactado de forma autocontenida para que se entienda sin la conversación.' },
+    tipo: { type: Type.STRING, description: `Uno de: ${MEMORY_TIPOS.join(', ')}.` },
+    etiquetas: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Etiquetas cortas para clasificar la memoria.' },
+    sucursalNombre: { type: Type.STRING, description: 'Sucursal a la que aplica, si aplica a una sola.' },
+  },
+  required: ['texto'],
+};
+
+const memorySearchParamsGemini = {
+  type: Type.OBJECT,
+  properties: {
+    consulta: { type: Type.STRING, description: 'Lo que se quiere recordar, en lenguaje natural.' },
+    limite: { type: Type.NUMBER, description: 'Cuántos recuerdos traer. Por defecto 4.' },
+  },
+  required: ['consulta'],
+};
+
+const geminiAtlasTools = {
+  functionDeclarations: [
+    { name: CHECKLIST_TOOL_NAME, description: CHECKLIST_TOOL_DESCRIPTION, parameters: checklistToolParamsGemini },
+    { name: MEMORY_SAVE_TOOL_NAME, description: MEMORY_SAVE_TOOL_DESCRIPTION, parameters: memorySaveParamsGemini },
+    { name: MEMORY_SEARCH_TOOL_NAME, description: MEMORY_SEARCH_TOOL_DESCRIPTION, parameters: memorySearchParamsGemini },
+  ],
+};
+
+const nvidiaAtlasTools = [
+  nvidiaChecklistTool,
+  {
+    type: 'function',
+    function: {
+      name: MEMORY_SAVE_TOOL_NAME,
+      description: MEMORY_SAVE_TOOL_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        properties: {
+          texto: { type: 'string', description: 'El hecho a recordar, autocontenido.' },
+          tipo: { type: 'string', description: `Uno de: ${MEMORY_TIPOS.join(', ')}.` },
+          etiquetas: { type: 'array', items: { type: 'string' } },
+          sucursalNombre: { type: 'string' },
+        },
+        required: ['texto'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: MEMORY_SEARCH_TOOL_NAME,
+      description: MEMORY_SEARCH_TOOL_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        properties: {
+          consulta: { type: 'string', description: 'Lo que se quiere recordar, en lenguaje natural.' },
+          limite: { type: 'number', description: 'Cuántos recuerdos traer. Por defecto 4.' },
+        },
+        required: ['consulta'],
+      },
+    },
+  },
+];
+
+// A missing vector index is the one failure mode worth naming explicitly: the
+// engine is otherwise fine and only needs the index created once.
+function describeMemoryError(err: any): string {
+  const message = String(err?.message ?? err);
+  if (message.includes('FAILED_PRECONDITION') || message.toLowerCase().includes('index')) {
+    // Firestore embeds a one-click console URL for creating the missing index.
+    // Keep it: it is the difference between a fix and a support ticket.
+    const url = message.match(/https:\/\/\S+/)?.[0]?.replace(/[.,)]+$/, '');
+    return url
+      ? `La memoria semántica no tiene su índice vectorial creado en Firestore todavía. Créalo aquí: ${url}`
+      : 'La memoria semántica no tiene su índice vectorial creado en Firestore todavía.';
+  }
+  return message;
+}
+
+async function executeMemorySaveToolCall(args: Record<string, any>): Promise<string> {
+  try {
+    const { id, tipo } = await saveMemory({
+      texto: String(args.texto ?? ''),
+      tipo: args.tipo ? String(args.tipo) : undefined,
+      etiquetas: args.etiquetas,
+      sucursalNombre: args.sucursalNombre ? String(args.sucursalNombre) : undefined,
+      origen: 'director',
+    });
+    return `Memoria guardada (${id}, tipo ${tipo}).`;
+  } catch (err: any) {
+    console.error('guardar_memoria falló:', err?.message ?? err);
+    return `No se pudo guardar en memoria: ${describeMemoryError(err)}`;
+  }
+}
+
+async function executeMemorySearchToolCall(args: Record<string, any>): Promise<string> {
+  try {
+    const hits = await searchMemory(String(args.consulta ?? ''), Number(args.limite) || 4);
+    if (!hits.length) return 'No hay nada registrado en memoria sobre eso todavía.';
+    return hits.map((h, i) => `${i + 1}. [${h.tipo}] ${h.texto}`).join('\n');
+  } catch (err: any) {
+    console.error('recordar_memoria falló:', err?.message ?? err);
+    return `No se pudo consultar la memoria: ${describeMemoryError(err)}`;
+  }
+}
+
+async function executeAtlasToolCall(name: string, args: Record<string, any>): Promise<string> {
+  if (name === CHECKLIST_TOOL_NAME) return executeChecklistToolCall(args);
+  if (name === MEMORY_SAVE_TOOL_NAME) return executeMemorySaveToolCall(args);
+  if (name === MEMORY_SEARCH_TOOL_NAME) return executeMemorySearchToolCall(args);
+  return 'Herramienta desconocida.';
+}
+
+// Retrieval before generation: pulled into the system prompt so Atlas answers
+// from memory without having to decide to call a tool first. Never throws —
+// memory being unavailable must not take the chat down with it.
+async function buildMemoryContext(consulta: string): Promise<string> {
+  if (!firestoreDb || !consulta.trim()) return '';
+  try {
+    const hits = await searchMemory(consulta, 3);
+    const relevantes = hits.filter((h) => h.distancia === null || h.distancia <= 0.8);
+    if (!relevantes.length) return '';
+    const lineas = relevantes.map((h) => `- [${h.tipo}] ${h.texto}`).join('\n');
+    return `\n\nMEMORIA DE LARGO PLAZO (recuperada por similitud; úsala solo si es pertinente, no la recites):\n${lineas}`;
+  } catch (err: any) {
+    console.warn('buildMemoryContext omitido:', describeMemoryError(err));
+    return '';
+  }
+}
+
 // NVIDIA NIM (OpenAI-compatible) chat completion helper
 async function callNvidiaChat(
   messages: { role: string; content: string }[],
@@ -1644,9 +1864,11 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
 3. Cero frases robóticas ("He procesado tu instrucción...", "Entendido, Director. He recibido..."). Ve directo al grano.
 4. Tono: Ejecutivo, refinado, conciso, inteligente y respetuoso (trátalo de "Director" o "Señor").
 5. Si te pregunta la hora, responde únicamente la hora de forma natural y elegante.
-6. Si el Director pide explícitamente registrar, corregir o actualizar el checklist de cocina (PEPS, aceite, limpieza, desinfección), usa la herramienta ${CHECKLIST_TOOL_NAME} para aplicar el cambio de verdad — no solo lo describas.`;
+6. Si el Director pide explícitamente registrar, corregir o actualizar el checklist de cocina (PEPS, aceite, limpieza, desinfección), usa la herramienta ${CHECKLIST_TOOL_NAME} para aplicar el cambio de verdad — no solo lo describas.
+7. Si el Director indica algo que deba persistir entre conversaciones ("recuerda que", "de ahora en adelante", una preferencia o una decisión), guárdalo con ${MEMORY_SAVE_TOOL_NAME}. Si pregunta por algo decidido o aprendido antes y no lo tienes en el contexto, búscalo con ${MEMORY_SEARCH_TOOL_NAME}.`;
 
   try {
+    const systemInstructionConMemoria = systemInstruction + (await buildMemoryContext(requestText));
     let respuesta_ia: string | undefined;
     let modelUsed = 'gemini-3.7-flash';
 
@@ -1655,13 +1877,13 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
       try {
         respuesta_ia = await callNvidiaChat(
           [
-            { role: 'system', content: systemInstruction },
+            { role: 'system', content: systemInstructionConMemoria },
             { role: 'user', content: requestText },
           ],
           {
             temperature: 0.2,
-            tools: [nvidiaChecklistTool],
-            onToolCall: (name, args) => (name === CHECKLIST_TOOL_NAME ? executeChecklistToolCall(args) : Promise.resolve('Herramienta desconocida.')),
+            tools: nvidiaAtlasTools,
+            onToolCall: executeAtlasToolCall,
           }
         );
         modelUsed = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b';
@@ -1672,7 +1894,7 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
 
     if (!respuesta_ia) {
       const aiClient = defaultAi;
-      const geminiConfig = { systemInstruction, temperature: 0.2, tools: [geminiChecklistTool] };
+      const geminiConfig = { systemInstruction: systemInstructionConMemoria, temperature: 0.2, tools: [geminiAtlasTools] };
       let response;
 
       try {
@@ -1690,8 +1912,8 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
       }
 
       const call = response?.functionCalls?.[0];
-      if (call?.name === CHECKLIST_TOOL_NAME) {
-        const toolResult = await executeChecklistToolCall(call.args || {});
+      if (call?.name) {
+        const toolResult = await executeAtlasToolCall(call.name, call.args || {});
         // Reuse the model's own content object (not a hand-rebuilt part) so any
         // thoughtSignature Gemini attached to the function call is preserved —
         // required for follow-up turns with tool results, or the API rejects it.
@@ -1703,7 +1925,7 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
             modelTurn,
             createUserContent([createPartFromFunctionResponse(call.id || call.name, call.name, { result: toolResult })]),
           ],
-          config: { systemInstruction, temperature: 0.2 },
+          config: { systemInstruction: systemInstructionConMemoria, temperature: 0.2 },
         });
       }
 
@@ -1852,6 +2074,68 @@ app.get('/api/atlas/autonomous-scan', async (_req, res) => {
   }
 });
 
+app.post('/api/atlas/memory', async (req, res) => {
+  const { texto, tipo, etiquetas, sucursalNombre, origen } = req.body ?? {};
+  if (!texto || typeof texto !== 'string') {
+    return res.status(400).json({ error: 'Se requiere el campo texto.' });
+  }
+
+  try {
+    const saved = await saveMemory({ texto, tipo, etiquetas, sucursalNombre, origen: origen ?? 'director' });
+    return res.json({ success: true, ...saved });
+  } catch (err: any) {
+    return res.status(500).json({ error: describeMemoryError(err) });
+  }
+});
+
+app.get('/api/atlas/memory/search', async (req, res) => {
+  const consulta = String(req.query.q ?? '').trim();
+  if (!consulta) return res.status(400).json({ error: 'Se requiere el parámetro q.' });
+
+  try {
+    const resultados = await searchMemory(consulta, Number(req.query.limite) || 4);
+    return res.json({ success: true, consulta, resultados });
+  } catch (err: any) {
+    return res.status(500).json({ error: describeMemoryError(err) });
+  }
+});
+
+// One-way projection of memory into Obsidian-shaped markdown. Firestore stays
+// the source of truth; the vault is a readable mirror, so Atlas never depends
+// on the vault being reachable to think.
+app.get('/api/atlas/memory/export', async (_req, res) => {
+  if (!firestoreDb) return res.status(503).json({ error: 'Firestore no disponible.' });
+
+  try {
+    const snapshot = await firestoreDb.collection(MEMORY_COLLECTION).orderBy('creadoEn', 'desc').limit(500).get();
+
+    const archivos = snapshot.docs.map((doc) => {
+      const data = doc.data();
+      const tipo = String(data.tipo ?? 'contexto');
+      const etiquetas = Array.isArray(data.etiquetas) ? data.etiquetas.map(String) : [];
+      const creado = data.creadoEn?.toDate?.()?.toISOString() ?? null;
+      const frontmatter = [
+        '---',
+        `id: ${doc.id}`,
+        `tipo: ${tipo}`,
+        `etiquetas: [${etiquetas.join(', ')}]`,
+        `sucursal: ${data.sucursalNombre ?? ''}`,
+        `origen: ${data.origen ?? 'atlas'}`,
+        `creado: ${creado ?? ''}`,
+        '---',
+      ].join('\n');
+      return {
+        ruta: `Atlas/${tipo}/${doc.id}.md`,
+        contenido: `${frontmatter}\n\n${String(data.texto ?? '')}\n`,
+      };
+    });
+
+    return res.json({ success: true, total: archivos.length, archivos });
+  } catch (err: any) {
+    return res.status(500).json({ error: describeMemoryError(err) });
+  }
+});
+
 // Reports the runtime facts that are otherwise only visible via gcloud:
 // which project/service account the container actually runs as, whether the
 // env vars survived deployment intact, and whether Firestore is reachable.
@@ -1916,6 +2200,14 @@ app.get('/api/atlas/diagnostics', async (_req, res) => {
     }
   }
 
+  let memoria: Record<string, unknown>;
+  try {
+    const hits = await searchMemory('prueba de disponibilidad de memoria', 1);
+    memoria = { engine: 'firestore-vector', collection: MEMORY_COLLECTION, dimensions: MEMORY_DIMENSIONS, searchOk: true, hits: hits.length };
+  } catch (err: any) {
+    memoria = { engine: 'firestore-vector', collection: MEMORY_COLLECTION, dimensions: MEMORY_DIMENSIONS, searchOk: false, error: describeMemoryError(err) };
+  }
+
   return res.json({
     checkedAt: new Date().toISOString(),
     runtime: {
@@ -1932,6 +2224,7 @@ app.get('/api/atlas/diagnostics', async (_req, res) => {
       NVIDIA_MODEL: process.env.NVIDIA_MODEL ?? null,
     },
     firestore,
+    memoria,
   });
 });
 
