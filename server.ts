@@ -1,11 +1,38 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type } from '@google/genai';
+import {
+  GoogleGenAI,
+  Type,
+  createUserContent,
+  createModelContent,
+  createPartFromFunctionCall,
+  createPartFromFunctionResponse,
+} from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { initializeApp as initializeAdminApp, getApps as getAdminApps, applicationDefault } from 'firebase-admin/app';
+import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 
 dotenv.config();
+
+// Firestore Admin access for Atlas' self-managed (autonomous) actions.
+// Uses Application Default Credentials — works natively on Cloud Run's
+// service account; requires `gcloud auth application-default login` for
+// local dev. Failures here only disable autonomous write actions, they
+// never crash the server (Atlas still works as a read-only chat agent).
+const FIREBASE_PROJECT_ID = 'atlas-v1-505407';
+const FIRESTORE_DATABASE_ID = 'ai-studio-agendacraftai-88228244-34b0-45f8-9d06-001ed8595880';
+
+let firestoreDb: FirebaseFirestore.Firestore | null = null;
+try {
+  const adminApp = getAdminApps().length
+    ? getAdminApps()[0]!
+    : initializeAdminApp({ credential: applicationDefault(), projectId: FIREBASE_PROJECT_ID });
+  firestoreDb = getFirestore(adminApp, FIRESTORE_DATABASE_ID);
+} catch (err: any) {
+  console.warn('Firebase Admin init failed — autonomous Firestore actions disabled:', err.message);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,6 +53,414 @@ const defaultAi = new GoogleGenAI({
     },
   },
 });
+
+// ==========================================
+// ATLAS SELF-MANAGED ACTIONS (function calling)
+// ==========================================
+// A single tool Atlas can invoke to actually change operational data
+// instead of only talking about it. Schema shared between providers:
+// Gemini format (Type enum) and OpenAI/NVIDIA format (JSON Schema) are
+// structurally identical for this simple flat-object case.
+const CHECKLIST_TOOL_NAME = 'actualizar_checklist_cocina';
+const CHECKLIST_TOOL_DESCRIPTION =
+  'Actualiza el checklist operativo de cocina más reciente de una sucursal (o crea uno si no existe hoy): rotulación PEPS, calidad de aceite de freidoras, limpieza de superficies, desinfección de vegetales u observaciones. Úsala solo cuando el Director pida explícitamente registrar, corregir o actualizar algo del checklist de cocina — no la uses solo para consultar información.';
+
+const checklistToolParamsGemini = {
+  type: Type.OBJECT,
+  properties: {
+    sucursalNombre: { type: Type.STRING, description: 'Nombre de la sucursal. Si no se especifica, usa "Sucursal Central".' },
+    rotulacionPEPS: { type: Type.BOOLEAN, description: 'true si la rotulación PEPS quedó correcta' },
+    limpiezaSuperficies: { type: Type.BOOLEAN },
+    desinfeccionVegetales: { type: Type.BOOLEAN },
+    aceiteFreidorasCalidad: { type: Type.STRING, description: 'Uno de: optimo, medio, cambiar' },
+    observaciones: { type: Type.STRING },
+  },
+};
+
+const geminiChecklistTool = {
+  functionDeclarations: [
+    { name: CHECKLIST_TOOL_NAME, description: CHECKLIST_TOOL_DESCRIPTION, parameters: checklistToolParamsGemini },
+  ],
+};
+
+const nvidiaChecklistTool = {
+  type: 'function',
+  function: {
+    name: CHECKLIST_TOOL_NAME,
+    description: CHECKLIST_TOOL_DESCRIPTION,
+    parameters: {
+      type: 'object',
+      properties: {
+        sucursalNombre: { type: 'string', description: 'Nombre de la sucursal. Si no se especifica, usa "Sucursal Central".' },
+        rotulacionPEPS: { type: 'boolean', description: 'true si la rotulación PEPS quedó correcta' },
+        limpiezaSuperficies: { type: 'boolean' },
+        desinfeccionVegetales: { type: 'boolean' },
+        aceiteFreidorasCalidad: { type: 'string', description: 'Uno de: optimo, medio, cambiar' },
+        observaciones: { type: 'string' },
+      },
+    },
+  },
+};
+
+// Executes the actual Firestore write for a checklist tool call. Returns a
+// short human-readable result the model can relay back to the Director.
+async function executeChecklistToolCall(args: Record<string, any>): Promise<string> {
+  if (!firestoreDb) {
+    return 'No se pudo actualizar el checklist: Atlas no tiene conexión con la base de datos en este momento.';
+  }
+
+  const sucursalNombre = (args.sucursalNombre || 'Sucursal Central').toString();
+  const fields: Record<string, any> = {};
+  for (const key of ['rotulacionPEPS', 'limpiezaSuperficies', 'desinfeccionVegetales', 'aceiteFreidorasCalidad', 'observaciones']) {
+    if (args[key] !== undefined) fields[key] = args[key];
+  }
+
+  const hasIssue =
+    fields.rotulacionPEPS === false ||
+    fields.limpiezaSuperficies === false ||
+    fields.desinfeccionVegetales === false ||
+    fields.aceiteFreidorasCalidad === 'cambiar';
+  const estado = hasIssue ? 'con_observaciones' : 'completo';
+
+  try {
+    const collection = firestoreDb.collection('cocina_checklists');
+    const snapshot = await collection
+      .where('sucursalNombre', '==', sucursalNombre)
+      .orderBy('creadoEn', 'desc')
+      .limit(1)
+      .get();
+
+    if (!snapshot.empty) {
+      const doc = snapshot.docs[0];
+      await doc.ref.update({
+        ...fields,
+        estado,
+        updatedAt: FieldValue.serverTimestamp(),
+        updatedByAtlas: true,
+      });
+      return `Checklist actualizado (${doc.id}) para ${sucursalNombre}: ${Object.keys(fields).join(', ') || 'sin cambios de campo'}. Estado: ${estado}.`;
+    }
+
+    const newDoc = await collection.add({
+      sucursalId: 'suc-central',
+      sucursalNombre,
+      fecha: new Date().toISOString().split('T')[0],
+      turno: 'operacion',
+      responsableUid: 'atlas-ai',
+      responsableNombre: 'Atlas (Autogestión IA)',
+      temperaturaCamaras: [],
+      limpiezaSuperficies: fields.limpiezaSuperficies ?? true,
+      rotulacionPEPS: fields.rotulacionPEPS ?? true,
+      aceiteFreidorasCalidad: fields.aceiteFreidorasCalidad ?? 'optimo',
+      desinfeccionVegetales: fields.desinfeccionVegetales ?? true,
+      cumplimientoPorcentaje: 0,
+      observaciones: fields.observaciones ?? '',
+      estado,
+      creadoEn: FieldValue.serverTimestamp(),
+      creadoPorAtlas: true,
+    });
+    return `Se creó un nuevo checklist (${newDoc.id}) para ${sucursalNombre} con los datos indicados. Estado: ${estado}.`;
+  } catch (err: any) {
+    console.error('executeChecklistToolCall: Firestore write failed:', err.message);
+    return 'No se pudo actualizar el checklist: error de permisos o conexión con la base de datos. Informa al Director que revise el acceso de Atlas a Firestore.';
+  }
+}
+
+// ==========================================
+// ATLAS MEMORY ENGINE (Firestore vector search)
+// ==========================================
+// Semantic memory lives in one collection, each note carrying its own
+// embedding, queried with findNearest(). Operational records (checklists,
+// incidencias) deliberately stay out of here and are read with exact queries —
+// embedding what can be matched exactly only costs precision.
+const MEMORY_COLLECTION = 'atlas_memoria';
+const MEMORY_EMBED_MODEL = 'gemini-embedding-001';
+// Firestore vector indexes cap at 2048 dimensions, so the model's 3072-dim
+// default cannot be indexed; 768 keeps the index small at negligible recall cost.
+const MEMORY_DIMENSIONS = 768;
+const MEMORY_TIPOS = ['decision', 'aprendizaje', 'preferencia', 'contexto'];
+
+type MemoriaHit = { id: string; texto: string; tipo: string; etiquetas: string[]; distancia: number | null };
+
+async function embedMemoryText(text: string, taskType: 'RETRIEVAL_DOCUMENT' | 'RETRIEVAL_QUERY'): Promise<number[]> {
+  const response = await defaultAi.models.embedContent({
+    model: MEMORY_EMBED_MODEL,
+    contents: text,
+    config: { taskType, outputDimensionality: MEMORY_DIMENSIONS },
+  });
+  const values = response.embeddings?.[0]?.values;
+  if (!values?.length) throw new Error('El modelo de embeddings no devolvió ningún vector.');
+  return values;
+}
+
+async function saveMemory(input: {
+  texto: string;
+  tipo?: string;
+  etiquetas?: string[];
+  sucursalNombre?: string;
+  origen?: string;
+}): Promise<{ id: string; tipo: string }> {
+  if (!firestoreDb) throw new Error('Firestore no disponible.');
+
+  const texto = input.texto.trim();
+  if (!texto) throw new Error('El texto de la memoria está vacío.');
+
+  const tipo = MEMORY_TIPOS.includes(input.tipo ?? '') ? input.tipo! : 'contexto';
+  const embedding = await embedMemoryText(texto, 'RETRIEVAL_DOCUMENT');
+
+  const doc = await firestoreDb.collection(MEMORY_COLLECTION).add({
+    texto,
+    tipo,
+    etiquetas: Array.isArray(input.etiquetas) ? input.etiquetas.slice(0, 12).map(String) : [],
+    sucursalNombre: input.sucursalNombre ?? null,
+    origen: input.origen ?? 'atlas',
+    embedding: FieldValue.vector(embedding),
+    dimensiones: MEMORY_DIMENSIONS,
+    creadoEn: FieldValue.serverTimestamp(),
+  });
+
+  return { id: doc.id, tipo };
+}
+
+async function searchMemory(consulta: string, limit = 4): Promise<MemoriaHit[]> {
+  if (!firestoreDb) throw new Error('Firestore no disponible.');
+
+  const queryVector = await embedMemoryText(consulta, 'RETRIEVAL_QUERY');
+  const snapshot = await firestoreDb
+    .collection(MEMORY_COLLECTION)
+    .findNearest({
+      vectorField: 'embedding',
+      queryVector,
+      limit: Math.min(Math.max(limit, 1), 20),
+      distanceMeasure: 'COSINE',
+      distanceResultField: 'distancia',
+    })
+    .get();
+
+  return snapshot.docs.map((doc) => {
+    const data = doc.data();
+    return {
+      id: doc.id,
+      texto: String(data.texto ?? ''),
+      tipo: String(data.tipo ?? 'contexto'),
+      etiquetas: Array.isArray(data.etiquetas) ? data.etiquetas.map(String) : [],
+      distancia: typeof data.distancia === 'number' ? data.distancia : null,
+    };
+  });
+}
+
+const MEMORY_SAVE_TOOL_NAME = 'guardar_memoria';
+const MEMORY_SAVE_TOOL_DESCRIPTION =
+  'Guarda un hecho duradero en la memoria de largo plazo de Atlas: una decisión del Director, un aprendizaje operativo, una preferencia suya o contexto del negocio que deba recordarse en conversaciones futuras. Úsala cuando el Director indique algo que deba persistir ("recuerda que...", "de ahora en adelante...", "mi preferencia es..."), no para datos operativos del día que ya viven en el checklist o en incidencias.';
+const MEMORY_SEARCH_TOOL_NAME = 'recordar_memoria';
+const MEMORY_SEARCH_TOOL_DESCRIPTION =
+  'Busca en la memoria de largo plazo de Atlas por significado, no por palabra exacta. Úsala cuando el Director pregunte qué se decidió antes, qué se aprendió o cuáles son sus preferencias, o cuando necesites contexto histórico que no está en la conversación actual.';
+
+const memorySaveParamsGemini = {
+  type: Type.OBJECT,
+  properties: {
+    texto: { type: Type.STRING, description: 'El hecho a recordar, redactado de forma autocontenida para que se entienda sin la conversación.' },
+    tipo: { type: Type.STRING, description: `Uno de: ${MEMORY_TIPOS.join(', ')}.` },
+    etiquetas: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Etiquetas cortas para clasificar la memoria.' },
+    sucursalNombre: { type: Type.STRING, description: 'Sucursal a la que aplica, si aplica a una sola.' },
+  },
+  required: ['texto'],
+};
+
+const memorySearchParamsGemini = {
+  type: Type.OBJECT,
+  properties: {
+    consulta: { type: Type.STRING, description: 'Lo que se quiere recordar, en lenguaje natural.' },
+    limite: { type: Type.NUMBER, description: 'Cuántos recuerdos traer. Por defecto 4.' },
+  },
+  required: ['consulta'],
+};
+
+const geminiAtlasTools = {
+  functionDeclarations: [
+    { name: CHECKLIST_TOOL_NAME, description: CHECKLIST_TOOL_DESCRIPTION, parameters: checklistToolParamsGemini },
+    { name: MEMORY_SAVE_TOOL_NAME, description: MEMORY_SAVE_TOOL_DESCRIPTION, parameters: memorySaveParamsGemini },
+    { name: MEMORY_SEARCH_TOOL_NAME, description: MEMORY_SEARCH_TOOL_DESCRIPTION, parameters: memorySearchParamsGemini },
+  ],
+};
+
+const nvidiaAtlasTools = [
+  nvidiaChecklistTool,
+  {
+    type: 'function',
+    function: {
+      name: MEMORY_SAVE_TOOL_NAME,
+      description: MEMORY_SAVE_TOOL_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        properties: {
+          texto: { type: 'string', description: 'El hecho a recordar, autocontenido.' },
+          tipo: { type: 'string', description: `Uno de: ${MEMORY_TIPOS.join(', ')}.` },
+          etiquetas: { type: 'array', items: { type: 'string' } },
+          sucursalNombre: { type: 'string' },
+        },
+        required: ['texto'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: MEMORY_SEARCH_TOOL_NAME,
+      description: MEMORY_SEARCH_TOOL_DESCRIPTION,
+      parameters: {
+        type: 'object',
+        properties: {
+          consulta: { type: 'string', description: 'Lo que se quiere recordar, en lenguaje natural.' },
+          limite: { type: 'number', description: 'Cuántos recuerdos traer. Por defecto 4.' },
+        },
+        required: ['consulta'],
+      },
+    },
+  },
+];
+
+// A missing vector index is the one failure mode worth naming explicitly: the
+// engine is otherwise fine and only needs the index created once.
+function describeMemoryError(err: any): string {
+  const message = String(err?.message ?? err);
+  if (message.includes('FAILED_PRECONDITION') || message.toLowerCase().includes('index')) {
+    // Firestore embeds a one-click console URL for creating the missing index.
+    // Keep it: it is the difference between a fix and a support ticket.
+    const url = message.match(/https:\/\/\S+/)?.[0]?.replace(/[.,)]+$/, '');
+    return url
+      ? `La memoria semántica no tiene su índice vectorial creado en Firestore todavía. Créalo aquí: ${url}`
+      : 'La memoria semántica no tiene su índice vectorial creado en Firestore todavía.';
+  }
+  return message;
+}
+
+async function executeMemorySaveToolCall(args: Record<string, any>): Promise<string> {
+  try {
+    const { id, tipo } = await saveMemory({
+      texto: String(args.texto ?? ''),
+      tipo: args.tipo ? String(args.tipo) : undefined,
+      etiquetas: args.etiquetas,
+      sucursalNombre: args.sucursalNombre ? String(args.sucursalNombre) : undefined,
+      origen: 'director',
+    });
+    return `Memoria guardada (${id}, tipo ${tipo}).`;
+  } catch (err: any) {
+    console.error('guardar_memoria falló:', err?.message ?? err);
+    return `No se pudo guardar en memoria: ${describeMemoryError(err)}`;
+  }
+}
+
+async function executeMemorySearchToolCall(args: Record<string, any>): Promise<string> {
+  try {
+    const hits = await searchMemory(String(args.consulta ?? ''), Number(args.limite) || 4);
+    if (!hits.length) return 'No hay nada registrado en memoria sobre eso todavía.';
+    return hits.map((h, i) => `${i + 1}. [${h.tipo}] ${h.texto}`).join('\n');
+  } catch (err: any) {
+    console.error('recordar_memoria falló:', err?.message ?? err);
+    return `No se pudo consultar la memoria: ${describeMemoryError(err)}`;
+  }
+}
+
+async function executeAtlasToolCall(name: string, args: Record<string, any>): Promise<string> {
+  if (name === CHECKLIST_TOOL_NAME) return executeChecklistToolCall(args);
+  if (name === MEMORY_SAVE_TOOL_NAME) return executeMemorySaveToolCall(args);
+  if (name === MEMORY_SEARCH_TOOL_NAME) return executeMemorySearchToolCall(args);
+  return 'Herramienta desconocida.';
+}
+
+// Retrieval before generation: pulled into the system prompt so Atlas answers
+// from memory without having to decide to call a tool first. Never throws —
+// memory being unavailable must not take the chat down with it.
+async function buildMemoryContext(consulta: string): Promise<string> {
+  if (!firestoreDb || !consulta.trim()) return '';
+  try {
+    const hits = await searchMemory(consulta, 3);
+    const relevantes = hits.filter((h) => h.distancia === null || h.distancia <= 0.8);
+    if (!relevantes.length) return '';
+    const lineas = relevantes.map((h) => `- [${h.tipo}] ${h.texto}`).join('\n');
+    return `\n\nMEMORIA DE LARGO PLAZO (recuperada por similitud; úsala solo si es pertinente, no la recites):\n${lineas}`;
+  } catch (err: any) {
+    console.warn('buildMemoryContext omitido:', describeMemoryError(err));
+    return '';
+  }
+}
+
+// NVIDIA NIM (OpenAI-compatible) chat completion helper
+async function callNvidiaChat(
+  messages: { role: string; content: string }[],
+  options: {
+    temperature?: number;
+    maxTokens?: number;
+    model?: string;
+    // Optional OpenAI-format tool definitions + a handler invoked with
+    // (toolName, parsedArgs) that performs the action and returns a short
+    // text result to relay back to the model. When omitted, behavior is
+    // identical to the original text-only helper.
+    tools?: any[];
+    onToolCall?: (name: string, args: Record<string, any>) => Promise<string>;
+  } = {}
+): Promise<string> {
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) throw new Error('NVIDIA_API_KEY no configurada');
+
+  const model = options.model || process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b';
+
+  const callOnce = async (msgs: any[]) => {
+    const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: msgs,
+        temperature: options.temperature ?? 0.3,
+        max_tokens: options.maxTokens ?? 1024,
+        // Reasoning models (e.g. Nemotron) default to exposing their chain-of-thought;
+        // Atlas only ever wants the final answer, never the raw reasoning trace.
+        chat_template_kwargs: { enable_thinking: false },
+        ...(options.tools ? { tools: options.tools } : {}),
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`NVIDIA API error ${response.status}: ${errText}`);
+    }
+    return response.json();
+  };
+
+  let data = await callOnce(messages);
+  let message = data?.choices?.[0]?.message;
+
+  if (message?.tool_calls?.length && options.onToolCall) {
+    const conversation: any[] = [...messages, message];
+    for (const call of message.tool_calls) {
+      let args: Record<string, any> = {};
+      try {
+        args = JSON.parse(call.function?.arguments || '{}');
+      } catch {
+        // Leave args empty if the model produced malformed JSON.
+      }
+      const result = await options.onToolCall(call.function?.name, args);
+      conversation.push({ role: 'tool', tool_call_id: call.id, content: result });
+    }
+    data = await callOnce(conversation);
+    message = data?.choices?.[0]?.message;
+  }
+
+  // Some reasoning models still return a separate reasoning_content even with thinking
+  // disabled; only ever surface `content`, and strip any stray <think>...</think> block
+  // a model might inline directly into it.
+  let text: string | undefined = message?.content;
+  if (text) {
+    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  }
+  if (!text) throw new Error('NVIDIA API: respuesta vacía o sin choices[0].message.content');
+  return text;
+}
 
 // Helper to sanitize and normalize agenda JSON
 function cleanJsonOutput(text: string): any {
@@ -1196,6 +1631,19 @@ function extractGroundingInfo(candidate: any) {
   };
 }
 
+// Heuristically pull "Acción/Paso/Recomendación" lines out of free-form agent text
+function extractSuggestedActions(text: string): string[] {
+  const suggestedActions: string[] = [];
+  const actionMatches = text.match(/(?:Acci[oó]n|Paso|Recomendaci[oó]n)\s*\d*[:.-]\s*([^\n\r]+)/gi);
+  if (actionMatches) {
+    actionMatches.slice(0, 3).forEach((m) => {
+      const clean = m.replace(/^(?:Acci[oó]n|Paso|Recomendaci[oó]n)\s*\d*[:.-]\s*/i, '').trim();
+      if (clean.length > 8 && clean.length < 120) suggestedActions.push(clean);
+    });
+  }
+  return suggestedActions;
+}
+
 // 1. Multi-turn Web Agent Chat with Google Search Grounding
 app.post('/api/web-agent/chat', async (req, res) => {
   const {
@@ -1238,7 +1686,33 @@ Instrucciones obligatorias:
     selectedModel = 'gemini-3.7-flash';
   }
 
+  if (messages.length === 0) {
+    return res.status(400).json({ error: 'No se enviaron mensajes en la conversación.' });
+  }
+
+  const nvMessages = [
+    { role: 'system', content: systemInstruction },
+    ...messages.map((m: any) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text })),
+  ];
+
   try {
+    // NVIDIA has no Google Search tool, so only prefer it when live grounding isn't requested.
+    if (!enableSearch && process.env.NVIDIA_API_KEY) {
+      try {
+        const textOutput = await callNvidiaChat(nvMessages, { temperature: 0.3 });
+        return res.json({
+          success: true,
+          text: textOutput,
+          grounding: { webSearchQueries: [], sources: [], groundingChunks: [] },
+          suggestedActions: extractSuggestedActions(textOutput),
+          modelUsed: process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
+          roleUsed: role,
+        });
+      } catch (nvErr: any) {
+        console.warn('NVIDIA web-agent/chat falló, usando Gemini:', nvErr.message);
+      }
+    }
+
     const aiClient = defaultAi;
 
     // Convert multi-turn message history for Gemini contents
@@ -1246,10 +1720,6 @@ Instrucciones obligatorias:
       role: m.sender === 'user' ? 'user' : 'model',
       parts: [{ text: m.text }],
     }));
-
-    if (contents.length === 0) {
-      return res.status(400).json({ error: 'No se enviaron mensajes en la conversación.' });
-    }
 
     const config: any = {
       systemInstruction,
@@ -1284,25 +1754,33 @@ Instrucciones obligatorias:
     const textOutput = response.text || '';
     const grounding = extractGroundingInfo(candidate);
 
-    // Extract suggested actions from text heuristically
-    const suggestedActions: string[] = [];
-    const actionMatches = textOutput.match(/(?:Acci[oó]n|Paso|Recomendaci[oó]n)\s*\d*[:.-]\s*([^\n\r]+)/gi);
-    if (actionMatches) {
-      actionMatches.slice(0, 3).forEach((m) => {
-        const clean = m.replace(/^(?:Acci[oó]n|Paso|Recomendaci[oó]n)\s*\d*[:.-]\s*/i, '').trim();
-        if (clean.length > 8 && clean.length < 120) suggestedActions.push(clean);
-      });
-    }
-
     return res.json({
       success: true,
       text: textOutput,
       grounding,
-      suggestedActions,
+      suggestedActions: extractSuggestedActions(textOutput),
       modelUsed: selectedModel,
       roleUsed: role,
     });
   } catch (error: any) {
+    // Gemini failed outright (e.g. quota exhausted) - try NVIDIA for a real (non-grounded) answer
+    // before resorting to the static canned response below.
+    if (process.env.NVIDIA_API_KEY) {
+      try {
+        const textOutput = await callNvidiaChat(nvMessages, { temperature: 0.3 });
+        return res.json({
+          success: true,
+          text: textOutput,
+          grounding: { webSearchQueries: [], sources: [], groundingChunks: [] },
+          suggestedActions: extractSuggestedActions(textOutput),
+          modelUsed: process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
+          roleUsed: role,
+        });
+      } catch (nvErr: any) {
+        console.warn('NVIDIA web-agent/chat (respaldo de emergencia) también falló:', nvErr.message);
+      }
+    }
+
     // Fallback response with simulated web task execution
     const lastUserMsg = messages[messages.length - 1]?.text || 'consulta general';
     const fallbackText = `### 🌐 Informe de Investigación Web (Atlas Web Agent)
@@ -1385,33 +1863,75 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
 2. NO menciones ventas, arqueos, cajas, inventarios ni estatus de sistemas a menos que te lo pregunten explícitamente.
 3. Cero frases robóticas ("He procesado tu instrucción...", "Entendido, Director. He recibido..."). Ve directo al grano.
 4. Tono: Ejecutivo, refinado, conciso, inteligente y respetuoso (trátalo de "Director" o "Señor").
-5. Si te pregunta la hora, responde únicamente la hora de forma natural y elegante.`;
+5. Si te pregunta la hora, responde únicamente la hora de forma natural y elegante.
+6. Si el Director pide explícitamente registrar, corregir o actualizar el checklist de cocina (PEPS, aceite, limpieza, desinfección), usa la herramienta ${CHECKLIST_TOOL_NAME} para aplicar el cambio de verdad — no solo lo describas.
+7. Si el Director indica algo que deba persistir entre conversaciones ("recuerda que", "de ahora en adelante", una preferencia o una decisión), guárdalo con ${MEMORY_SAVE_TOOL_NAME}. Si pregunta por algo decidido o aprendido antes y no lo tienes en el contexto, búscalo con ${MEMORY_SEARCH_TOOL_NAME}.`;
 
   try {
-    const aiClient = defaultAi;
-    let response;
+    const systemInstructionConMemoria = systemInstruction + (await buildMemoryContext(requestText));
+    let respuesta_ia: string | undefined;
+    let modelUsed = 'gemini-3.7-flash';
 
-    try {
-      response = await aiClient.models.generateContent({
-        model: 'gemini-3.7-flash',
-        contents: requestText,
-        config: {
-          systemInstruction,
-          temperature: 0.2,
-        },
-      });
-    } catch (modelErr: any) {
-      response = await aiClient.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: requestText,
-        config: {
-          systemInstruction,
-          temperature: 0.2,
-        },
-      });
+    // Prefer NVIDIA NIM when configured; fall back to Gemini transparently on any failure.
+    if (process.env.NVIDIA_API_KEY) {
+      try {
+        respuesta_ia = await callNvidiaChat(
+          [
+            { role: 'system', content: systemInstructionConMemoria },
+            { role: 'user', content: requestText },
+          ],
+          {
+            temperature: 0.2,
+            tools: nvidiaAtlasTools,
+            onToolCall: executeAtlasToolCall,
+          }
+        );
+        modelUsed = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b';
+      } catch (nvErr: any) {
+        console.warn('NVIDIA jarvis-command falló, usando Gemini como respaldo:', nvErr.message);
+      }
     }
 
-    const respuesta_ia = response?.text?.trim() || `A su servicio, Señor. Son las ${horaStr}.`;
+    if (!respuesta_ia) {
+      const aiClient = defaultAi;
+      const geminiConfig = { systemInstruction: systemInstructionConMemoria, temperature: 0.2, tools: [geminiAtlasTools] };
+      let response;
+
+      try {
+        response = await aiClient.models.generateContent({
+          model: 'gemini-3.7-flash',
+          contents: requestText,
+          config: geminiConfig,
+        });
+      } catch (modelErr: any) {
+        response = await aiClient.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: requestText,
+          config: geminiConfig,
+        });
+      }
+
+      const call = response?.functionCalls?.[0];
+      if (call?.name) {
+        const toolResult = await executeAtlasToolCall(call.name, call.args || {});
+        // Reuse the model's own content object (not a hand-rebuilt part) so any
+        // thoughtSignature Gemini attached to the function call is preserved —
+        // required for follow-up turns with tool results, or the API rejects it.
+        const modelTurn = response?.candidates?.[0]?.content ?? createModelContent([createPartFromFunctionCall(call.name, call.args || {})]);
+        response = await aiClient.models.generateContent({
+          model: 'gemini-3.7-flash',
+          contents: [
+            createUserContent(requestText),
+            modelTurn,
+            createUserContent([createPartFromFunctionResponse(call.id || call.name, call.name, { result: toolResult })]),
+          ],
+          config: { systemInstruction: systemInstructionConMemoria, temperature: 0.2 },
+        });
+      }
+
+      respuesta_ia = response?.text?.trim() || `A su servicio, Señor. Son las ${horaStr}.`;
+      modelUsed = 'gemini-3.7-flash';
+    }
 
     return res.json({
       status: 'PROCESSED',
@@ -1420,9 +1940,11 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
       text: respuesta_ia,
       horaStr,
       fechaStr,
-      modelUsed: 'gemini-3.7-flash',
+      modelUsed,
     });
   } catch (error: any) {
+    console.error('jarvis-command: both NVIDIA and Gemini failed, using heuristic fallback:', error);
+
     // Cognitive NLP executive fallback solver for uninterrupted Jarvis performance
     let fallbackText = `A su servicio, Señor.`;
     const lower = requestText.toLowerCase();
@@ -1478,6 +2000,234 @@ REGLAS ESTRICTAS DE COMPORTAMIENTO:
   }
 });
 
+// Autonomous background scan — meant to be hit by Cloud Scheduler on a timer,
+// independent of any browser being open. Looks for critical incidents and
+// kitchen checklist issues, and writes a proactive notification doc for each
+// one not already surfaced, so it appears as a toast for whoever is logged in.
+app.get('/api/atlas/autonomous-scan', async (_req, res) => {
+  if (!firestoreDb) {
+    return res.status(503).json({ error: 'Firestore no disponible; escaneo autónomo deshabilitado.' });
+  }
+
+  try {
+    const notificationsCreated: string[] = [];
+
+    const incidenciasSnap = await firestoreDb
+      .collection('incidencias_capitanes')
+      .orderBy('fecha', 'desc')
+      .limit(50)
+      .get();
+
+    for (const doc of incidenciasSnap.docs) {
+      const data = doc.data();
+      const isCritical = data.prioridad === 'critica' || data.prioridad === 'alta';
+      const isUnresolved = data.estado !== 'resuelta' && data.estado !== 'resuelto';
+      if (!isCritical || !isUnresolved) continue;
+
+      const notifId = `auto-inc-${doc.id}`;
+      const existing = await firestoreDb.collection('notificaciones').doc(notifId).get();
+      if (existing.exists) continue;
+
+      await firestoreDb.collection('notificaciones').doc(notifId).set({
+        recipientId: 'director-master',
+        type: 'tarea_urgente',
+        title: `Incidencia ${String(data.prioridad).toUpperCase()}: ${data.titulo || 'Sin título'}`,
+        message: `Detectada por escaneo autónomo de Atlas en ${data.sucursalNombre || 'sucursal'}.`,
+        status: 'pending',
+        createdAt: FieldValue.serverTimestamp(),
+        createdByAtlas: true,
+      });
+      notificationsCreated.push(notifId);
+    }
+
+    const checklistsSnap = await firestoreDb
+      .collection('cocina_checklists')
+      .orderBy('creadoEn', 'desc')
+      .limit(50)
+      .get();
+
+    for (const doc of checklistsSnap.docs) {
+      const data = doc.data();
+      const hasIssue = data.rotulacionPEPS === false || data.aceiteFreidorasCalidad === 'cambiar';
+      if (!hasIssue) continue;
+
+      const notifId = `auto-checklist-${doc.id}`;
+      const existing = await firestoreDb.collection('notificaciones').doc(notifId).get();
+      if (existing.exists) continue;
+
+      await firestoreDb.collection('notificaciones').doc(notifId).set({
+        recipientId: 'director-master',
+        type: 'alerta',
+        title: `Alerta de Inocuidad Cocina — ${data.sucursalNombre || 'Sucursal'}`,
+        message: 'Rotulación PEPS o calidad de aceite requiere atención (detectado por escaneo autónomo de Atlas).',
+        status: 'pending',
+        createdAt: FieldValue.serverTimestamp(),
+        createdByAtlas: true,
+      });
+      notificationsCreated.push(notifId);
+    }
+
+    return res.json({ success: true, scannedAt: new Date().toISOString(), notificationsCreated });
+  } catch (error: any) {
+    console.error('autonomous-scan failed:', error);
+    return res.status(500).json({ error: 'Fallo el escaneo autónomo.', detail: error.message });
+  }
+});
+
+app.post('/api/atlas/memory', async (req, res) => {
+  const { texto, tipo, etiquetas, sucursalNombre, origen } = req.body ?? {};
+  if (!texto || typeof texto !== 'string') {
+    return res.status(400).json({ error: 'Se requiere el campo texto.' });
+  }
+
+  try {
+    const saved = await saveMemory({ texto, tipo, etiquetas, sucursalNombre, origen: origen ?? 'director' });
+    return res.json({ success: true, ...saved });
+  } catch (err: any) {
+    return res.status(500).json({ error: describeMemoryError(err) });
+  }
+});
+
+app.get('/api/atlas/memory/search', async (req, res) => {
+  const consulta = String(req.query.q ?? '').trim();
+  if (!consulta) return res.status(400).json({ error: 'Se requiere el parámetro q.' });
+
+  try {
+    const resultados = await searchMemory(consulta, Number(req.query.limite) || 4);
+    return res.json({ success: true, consulta, resultados });
+  } catch (err: any) {
+    return res.status(500).json({ error: describeMemoryError(err) });
+  }
+});
+
+// One-way projection of memory into Obsidian-shaped markdown. Firestore stays
+// the source of truth; the vault is a readable mirror, so Atlas never depends
+// on the vault being reachable to think.
+app.get('/api/atlas/memory/export', async (_req, res) => {
+  if (!firestoreDb) return res.status(503).json({ error: 'Firestore no disponible.' });
+
+  try {
+    const snapshot = await firestoreDb.collection(MEMORY_COLLECTION).orderBy('creadoEn', 'desc').limit(500).get();
+
+    const archivos = snapshot.docs.map((doc) => {
+      const data = doc.data();
+      const tipo = String(data.tipo ?? 'contexto');
+      const etiquetas = Array.isArray(data.etiquetas) ? data.etiquetas.map(String) : [];
+      const creado = data.creadoEn?.toDate?.()?.toISOString() ?? null;
+      const frontmatter = [
+        '---',
+        `id: ${doc.id}`,
+        `tipo: ${tipo}`,
+        `etiquetas: [${etiquetas.join(', ')}]`,
+        `sucursal: ${data.sucursalNombre ?? ''}`,
+        `origen: ${data.origen ?? 'atlas'}`,
+        `creado: ${creado ?? ''}`,
+        '---',
+      ].join('\n');
+      return {
+        ruta: `Atlas/${tipo}/${doc.id}.md`,
+        contenido: `${frontmatter}\n\n${String(data.texto ?? '')}\n`,
+      };
+    });
+
+    return res.json({ success: true, total: archivos.length, archivos });
+  } catch (err: any) {
+    return res.status(500).json({ error: describeMemoryError(err) });
+  }
+});
+
+// Reports the runtime facts that are otherwise only visible via gcloud:
+// which project/service account the container actually runs as, whether the
+// env vars survived deployment intact, and whether Firestore is reachable.
+// Never returns secret values — only presence, length and a mangling flag.
+app.get('/api/atlas/diagnostics', async (_req, res) => {
+  const metadata = async (path: string): Promise<string | null> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    try {
+      const r = await fetch(`http://metadata.google.internal/computeMetadata/v1/${path}`, {
+        headers: { 'Metadata-Flavor': 'Google' },
+        signal: controller.signal,
+      });
+      return r.ok ? (await r.text()).trim() : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const describeEnv = (name: string) => {
+    const value = process.env[name];
+    if (!value) return { present: false };
+    return {
+      present: true,
+      length: value.length,
+      // A value holding ',' or '=' means a shell split KEY=VAL,KEY=VAL wrong
+      // and collapsed every pair into this one variable.
+      looksMangled: value.includes(',') || value.includes('='),
+    };
+  };
+
+  const [serviceAccount, numericProjectId, metadataProjectId] = await Promise.all([
+    metadata('instance/service-accounts/default/email'),
+    metadata('project/numeric-project-id'),
+    metadata('project/project-id'),
+  ]);
+
+  let firestore: Record<string, unknown>;
+  if (!firestoreDb) {
+    firestore = { initialized: false, reason: 'Firebase Admin init failed at boot.' };
+  } else {
+    try {
+      const snap = await firestoreDb.collection('cocina_checklists').limit(1).get();
+      firestore = {
+        initialized: true,
+        readOk: true,
+        targetProjectId: FIREBASE_PROJECT_ID,
+        databaseId: FIRESTORE_DATABASE_ID,
+        sampleCollection: 'cocina_checklists',
+        docsFound: snap.size,
+      };
+    } catch (error: any) {
+      firestore = {
+        initialized: true,
+        readOk: false,
+        targetProjectId: FIREBASE_PROJECT_ID,
+        databaseId: FIRESTORE_DATABASE_ID,
+        error: error?.message ?? String(error),
+      };
+    }
+  }
+
+  let memoria: Record<string, unknown>;
+  try {
+    const hits = await searchMemory('prueba de disponibilidad de memoria', 1);
+    memoria = { engine: 'firestore-vector', collection: MEMORY_COLLECTION, dimensions: MEMORY_DIMENSIONS, searchOk: true, hits: hits.length };
+  } catch (err: any) {
+    memoria = { engine: 'firestore-vector', collection: MEMORY_COLLECTION, dimensions: MEMORY_DIMENSIONS, searchOk: false, error: describeMemoryError(err) };
+  }
+
+  return res.json({
+    checkedAt: new Date().toISOString(),
+    runtime: {
+      service: process.env.K_SERVICE ?? null,
+      revision: process.env.K_REVISION ?? null,
+      runtimeProjectId: metadataProjectId ?? process.env.GOOGLE_CLOUD_PROJECT ?? null,
+      runtimeProjectNumber: numericProjectId,
+      serviceAccount,
+      onCloudRun: Boolean(process.env.K_SERVICE),
+    },
+    env: {
+      GEMINI_API_KEY: describeEnv('GEMINI_API_KEY'),
+      NVIDIA_API_KEY: describeEnv('NVIDIA_API_KEY'),
+      NVIDIA_MODEL: process.env.NVIDIA_MODEL ?? null,
+    },
+    firestore,
+    memoria,
+  });
+});
+
 // 2. Autonomous Web Task Execution (Plan -> Search -> Analyze -> Synthesize)
 app.post('/api/web-agent/task-execute', async (req, res) => {
   const { taskQuery, role = 'auditor_operativo', targetUrls = [] } = req.body;
@@ -1525,6 +2275,41 @@ Estructura tu respuesta en 4 secciones claras:
     });
   } catch (error: any) {
     console.error('Error executing web task:', error);
+
+    // Gemini + Google Search failed (e.g. grounding quota exhausted) - try NVIDIA for a real
+    // (non-grounded, best-effort from model knowledge) synthesis before the static canned text.
+    if (process.env.NVIDIA_API_KEY) {
+      try {
+        const nvSummary = await callNvidiaChat(
+          [
+            {
+              role: 'system',
+              content: 'Eres un Agente Autónomo de Investigación y Ejecución de Tareas Web. No tienes acceso a búsqueda en vivo en este modo; responde con tu mejor conocimiento y acláralo si es relevante.',
+            },
+            {
+              role: 'user',
+              content: `Ejecuta la siguiente tarea de forma exhaustiva:\n"${taskQuery}"\n${targetUrls.length > 0 ? `\nURLs de referencia prioritarias: ${targetUrls.join(', ')}` : ''}\n\nEstructura tu respuesta en 4 secciones claras:\n1. 📋 PLAN DE TRABAJO Y BÚSQUEDA: Qué términos se investigarían y por qué.\n2. 🔍 HALLAZGOS Y DATOS VERIFICADOS: Hechos concretos relevantes.\n3. 📊 ANÁLISIS DE IMPACTO OPERATIVO: Cómo aplica esto a restaurantes y sucursales.\n4. ✅ ENTREGABLE & CHECKLIST ACCIONABLE: Lista de tareas directas a implementar.`,
+            },
+          ],
+          { temperature: 0.2, maxTokens: 1536 }
+        );
+
+        return res.json({
+          success: true,
+          summary: nvSummary,
+          grounding: { webSearchQueries: [taskQuery], sources: [], groundingChunks: [] },
+          steps: [
+            { id: 'step-1', title: 'Planificación de tarea', status: 'completed', actionType: 'search', details: `Consulta formulada para: ${taskQuery}` },
+            { id: 'step-2', title: 'Síntesis con NVIDIA NIM (sin búsqueda en vivo)', status: 'completed', actionType: 'synthesize', details: 'Google Search no disponible en este modo; respuesta generada desde conocimiento del modelo.' },
+            { id: 'step-3', title: 'Generación de entregable accionable', status: 'completed', actionType: 'export', details: 'Checklist y recomendaciones listas para aplicar.' },
+          ],
+          modelUsed: process.env.NVIDIA_MODEL || 'nvidia/nemotron-3.5-lightning-30b-a3b',
+        });
+      } catch (nvErr: any) {
+        console.warn('NVIDIA web-agent/task-execute (respaldo) también falló:', nvErr.message);
+      }
+    }
+
     return res.json({
       success: true,
       summary: `### 📋 Tarea Web Ejecutada: ${taskQuery}\n\nSe completó el ciclo de investigación web con fuentes de referencia de la industria. Se generaron las recomendaciones tácticas y el plan de acción operativo.`,
@@ -1576,35 +2361,52 @@ REGLAS ESTRICTAS DE VALIDACIÓN:
    - ## Criterios de Validación & Entregables
 4. Devuelve ÚNICAMENTE el contenido del archivo SKILL.md (puedes envolverlo en bloque markdown o devolver el texto directo).`;
 
+  const userPrompt = `Genera una habilidad (SKILL.md) para el siguiente requerimiento:
+"${prompt}"
+Categoría: ${category}
+Herramientas sugeridas: ${allowedTools.join(', ')}`;
+
   try {
-    let response;
-    try {
-      response = await defaultAi.models.generateContent({
-        model: 'gemini-3.7-flash',
-        contents: `Genera una habilidad (SKILL.md) para el siguiente requerimiento:
-"${prompt}"
-Categoría: ${category}
-Herramientas sugeridas: ${allowedTools.join(', ')}`,
-        config: {
-          systemInstruction,
-          temperature: 0.2,
-        },
-      });
-    } catch (err: any) {
-      response = await defaultAi.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: `Genera una habilidad (SKILL.md) para el siguiente requerimiento:
-"${prompt}"
-Categoría: ${category}
-Herramientas sugeridas: ${allowedTools.join(', ')}`,
-        config: {
-          systemInstruction,
-          temperature: 0.2,
-        },
-      });
+    let content: string | undefined;
+
+    if (process.env.NVIDIA_API_KEY) {
+      try {
+        content = await callNvidiaChat(
+          [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: userPrompt },
+          ],
+          { temperature: 0.2, maxTokens: 1536 }
+        );
+      } catch (nvErr: any) {
+        console.warn('NVIDIA skills/generate falló, usando Gemini como respaldo:', nvErr.message);
+      }
     }
 
-    let content = response.text || '';
+    if (!content) {
+      let response;
+      try {
+        response = await defaultAi.models.generateContent({
+          model: 'gemini-3.7-flash',
+          contents: userPrompt,
+          config: {
+            systemInstruction,
+            temperature: 0.2,
+          },
+        });
+      } catch (err: any) {
+        response = await defaultAi.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: userPrompt,
+          config: {
+            systemInstruction,
+            temperature: 0.2,
+          },
+        });
+      }
+      content = response.text || '';
+    }
+
     if (content.startsWith('```markdown')) {
       content = content.replace(/^```markdown\s*/, '').replace(/\s*```$/, '');
     } else if (content.startsWith('```')) {
