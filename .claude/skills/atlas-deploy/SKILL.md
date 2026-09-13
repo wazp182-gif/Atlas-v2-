@@ -106,6 +106,48 @@ independiente de cualquier sesión de navegador):
 gcloud scheduler jobs create http atlas-autonomous-scan --project=flash-rock-508419-q2 --location=us-central1 --schedule="*/15 * * * *" --uri="https://atlas-v2-app-480057719321.us-central1.run.app/api/atlas/autonomous-scan" --http-method=GET
 ```
 
+## Motor de memoria (Firestore vector search)
+
+Colección `atlas_memoria`, embeddings `gemini-embedding-001` a **768
+dimensiones**. No subas a 3072: el índice vectorial de Firestore corta en
+2048 y el índice no se puede crear.
+
+En el emulador `findNearest` funciona sin índice. **En Firestore real
+exige un índice vectorial** o falla con `FAILED_PRECONDITION`. Crear una vez:
+
+La vía confiable — pega la URL de `/api/atlas/memory/search?q=prueba` o de
+`/api/atlas/diagnostics` en el navegador; si falta el índice, el campo de
+error trae un enlace de consola que lo crea con un clic. Esto evita pelear
+con el escapado de JSON en PowerShell.
+
+Por comando (el JSON con comillas dobles dentro de comillas simples es
+frágil en PowerShell, verifica el resultado):
+
+```powershell
+gcloud firestore indexes composite create --project=atlas-v1-505407 --database="ai-studio-agendacraftai-88228244-34b0-45f8-9d06-001ed8595880" --collection-group=atlas_memoria --query-scope=COLLECTION --field-config=field-path=embedding,vector-config='{"dimension":"768","flat":"{}"}'
+```
+
+Endpoints: `POST /api/atlas/memory` (guardar), `GET /api/atlas/memory/search?q=`
+(buscar), `GET /api/atlas/memory/export` (proyección markdown para Obsidian).
+
+Regla de diseño, no la rompas: Firestore es la fuente de verdad y el vault de
+Obsidian es solo una proyección de lectura. Datos operativos estructurados
+(checklists, incidencias) se consultan con query exacta, no se vectorizan.
+
+## Probar sin credenciales de GCP
+
+El emulador de Firestore permite verificar todo el motor de memoria de punta a
+punta sin tocar producción ni necesitar ADC:
+
+```bash
+npm install --no-save --prefix /tmp/fbtools firebase-tools
+/tmp/fbtools/node_modules/.bin/firebase emulators:start --only firestore --project atlas-v1-505407
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8085 npx tsx server.ts
+```
+
+Requiere Java (hay openjdk 21 en el sandbox). Los embeddings sí salen a
+`generativelanguage.googleapis.com`, que la política de red permite.
+
 ## Límite de acceso
 
 Claude (este agente) NO tiene gcloud, NO puede autenticarse contra GCP del
