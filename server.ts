@@ -1852,6 +1852,89 @@ app.get('/api/atlas/autonomous-scan', async (_req, res) => {
   }
 });
 
+// Reports the runtime facts that are otherwise only visible via gcloud:
+// which project/service account the container actually runs as, whether the
+// env vars survived deployment intact, and whether Firestore is reachable.
+// Never returns secret values — only presence, length and a mangling flag.
+app.get('/api/atlas/diagnostics', async (_req, res) => {
+  const metadata = async (path: string): Promise<string | null> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1500);
+    try {
+      const r = await fetch(`http://metadata.google.internal/computeMetadata/v1/${path}`, {
+        headers: { 'Metadata-Flavor': 'Google' },
+        signal: controller.signal,
+      });
+      return r.ok ? (await r.text()).trim() : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const describeEnv = (name: string) => {
+    const value = process.env[name];
+    if (!value) return { present: false };
+    return {
+      present: true,
+      length: value.length,
+      // A value holding ',' or '=' means a shell split KEY=VAL,KEY=VAL wrong
+      // and collapsed every pair into this one variable.
+      looksMangled: value.includes(',') || value.includes('='),
+    };
+  };
+
+  const [serviceAccount, numericProjectId, metadataProjectId] = await Promise.all([
+    metadata('instance/service-accounts/default/email'),
+    metadata('project/numeric-project-id'),
+    metadata('project/project-id'),
+  ]);
+
+  let firestore: Record<string, unknown>;
+  if (!firestoreDb) {
+    firestore = { initialized: false, reason: 'Firebase Admin init failed at boot.' };
+  } else {
+    try {
+      const snap = await firestoreDb.collection('cocina_checklists').limit(1).get();
+      firestore = {
+        initialized: true,
+        readOk: true,
+        targetProjectId: FIREBASE_PROJECT_ID,
+        databaseId: FIRESTORE_DATABASE_ID,
+        sampleCollection: 'cocina_checklists',
+        docsFound: snap.size,
+      };
+    } catch (error: any) {
+      firestore = {
+        initialized: true,
+        readOk: false,
+        targetProjectId: FIREBASE_PROJECT_ID,
+        databaseId: FIRESTORE_DATABASE_ID,
+        error: error?.message ?? String(error),
+      };
+    }
+  }
+
+  return res.json({
+    checkedAt: new Date().toISOString(),
+    runtime: {
+      service: process.env.K_SERVICE ?? null,
+      revision: process.env.K_REVISION ?? null,
+      runtimeProjectId: metadataProjectId ?? process.env.GOOGLE_CLOUD_PROJECT ?? null,
+      runtimeProjectNumber: numericProjectId,
+      serviceAccount,
+      onCloudRun: Boolean(process.env.K_SERVICE),
+    },
+    env: {
+      GEMINI_API_KEY: describeEnv('GEMINI_API_KEY'),
+      NVIDIA_API_KEY: describeEnv('NVIDIA_API_KEY'),
+      NVIDIA_MODEL: process.env.NVIDIA_MODEL ?? null,
+    },
+    firestore,
+  });
+});
+
 // 2. Autonomous Web Task Execution (Plan -> Search -> Analyze -> Synthesize)
 app.post('/api/web-agent/task-execute', async (req, res) => {
   const { taskQuery, role = 'auditor_operativo', targetUrls = [] } = req.body;
